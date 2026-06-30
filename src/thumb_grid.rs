@@ -1,0 +1,473 @@
+//! Shared thumbnail-grid rendering used by both the import dialog and
+//! the main library page.
+//!
+//! The module owns:
+//! * the per-card layout (3:2 image area + filename strip),
+//! * selection / in-catalog visual states (selectable opt-in),
+//! * the row-by-row horizontally-centered grid layout,
+//! * the GPU texture cache (so we re-upload at most once per cell).
+//!
+//! Callers provide the data and the bytes; we draw.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use eframe::egui;
+
+/// Target longest edge for the decoded thumbnail, in pixels.
+pub const THUMB_MAX_DIM: u32 = 256;
+
+/// Pixel size of the longest edge of every cell in the grid.
+pub const THUMB_CELL: f32 = 156.0;
+/// Min / max cells per row.
+pub const MIN_COLS: usize = 3;
+pub const MAX_COLS: usize = 8;
+/// 3:2 aspect ratio (typical for full-frame cameras and most dSLRs /
+/// mirrorless bodies). Used as the canonical card aspect when we
+/// don't have real dimensions for the source.
+pub const CARD_ASPECT_W: f32 = 3.0;
+pub const CARD_ASPECT_H: f32 = 2.0;
+/// Horizontal spacing between cards in a row, in pixels.
+pub const COL_SPACING: f32 = 8.0;
+/// Vertical spacing between rows, in pixels.
+pub const ROW_SPACING: f32 = 8.0;
+/// Height of the filename strip below the image.
+pub const LABEL_H: f32 = 18.0;
+/// Margin around the image inside its card.
+pub const INNER_MARGIN: f32 = 4.0;
+
+/// A decoded thumbnail ready to be uploaded to the GPU.
+#[derive(Debug, Clone)]
+pub struct Thumbnail {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    /// The largest dimension we asked for. Useful for layout.
+    pub max_dim: u32,
+}
+
+/// Thumbnail bytes carried alongside the row data so the render
+/// thread can read them without re-extracting.
+#[derive(Debug, Clone)]
+pub struct ThumbnailBytes {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// What a card should look like. Most fields are optional; the
+/// defaults describe the plain library card (no selection, no hints).
+#[derive(Debug, Clone)]
+pub struct ThumbCardConfig {
+    /// Cell width in pixels.
+    pub cell_w: f32,
+    /// If `true`, clicking the card toggles `selected` and the
+    /// `CardResponse::clicked` flag fires. The caller is expected to
+    /// also update its own state.
+    pub selectable: bool,
+    /// Force the card into the "selected" visual state. Use for
+    /// import dialogs where selection is held outside the renderer.
+    pub selected: bool,
+    /// Force the "already in catalog" visual state (grey label, no
+    /// selection). Used by the import dialog to mark duplicates.
+    pub in_catalog: bool,
+    /// If `Some`, use this text as the label instead of the
+    /// caller's filename.
+    pub label_override: Option<String>,
+}
+
+impl Default for ThumbCardConfig {
+    fn default() -> Self {
+        Self {
+            cell_w: THUMB_CELL,
+            selectable: false,
+            selected: false,
+            in_catalog: false,
+            label_override: None,
+        }
+    }
+}
+
+/// Outcome of drawing a card, returned to the caller so it can update
+/// its own state (e.g. toggle a `selected` flag in the photo row).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CardResponse {
+    /// `true` if the user just clicked the card. The caller should
+    /// toggle the corresponding `selected` flag in its own state.
+    pub clicked: bool,
+    /// `true` if the card is currently being hovered.
+    pub hovered: bool,
+}
+
+/// Grid metrics computed from the available width.
+#[derive(Debug, Clone, Copy)]
+pub struct GridLayout {
+    pub cells_per_row: usize,
+    pub cell_w: f32,
+    pub full_row_w: f32,
+    /// Width of a single cell including its right-side column gap
+    /// (but not the trailing gap on the last cell of a row).
+    pub cell_pitch: f32,
+}
+
+/// Compute the grid metrics for the available width. Always clamps
+/// to at least [`MIN_COLS`] so very narrow windows still render.
+pub fn compute_grid(ui: &egui::Ui) -> GridLayout {
+    let available = ui.available_width();
+    let cell_w = THUMB_CELL.max(96.0);
+    let cells_per_row = ((available / (cell_w + COL_SPACING)).floor() as usize).clamp(MIN_COLS, MAX_COLS);
+    let cell_pitch = cell_w + COL_SPACING;
+    let full_row_w = cells_per_row as f32 * cell_pitch - COL_SPACING;
+    GridLayout {
+        cells_per_row,
+        cell_w,
+        full_row_w,
+        cell_pitch,
+    }
+}
+
+/// Total height of a card (image + label + margin), used for the
+/// vertical scroll area estimate.
+pub fn card_height(cell_w: f32) -> f32 {
+    let image_h = cell_w * (CARD_ASPECT_H / CARD_ASPECT_W);
+    image_h + LABEL_H + INNER_MARGIN * 2.0
+}
+
+/// Opaque, hashable cache key for a cell's GPU texture. The library
+/// uses the photo's database id; the import dialog hashes the file
+/// path. Either way, a stable key keeps the texture alive across
+/// refreshes and avoids re-uploading the same bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CacheKey(pub u64);
+
+impl CacheKey {
+    /// Hash a file path into a stable 64-bit cache key. Uses Rust's
+    /// default hasher for speed; the values are process-local so
+    /// we don't need cryptographic strength.
+    pub fn from_path(path: &str) -> Self {
+        use std::hash::{BuildHasher, Hasher, RandomState};
+        let mut h = RandomState::new().build_hasher();
+        h.write(path.as_bytes());
+        CacheKey(h.finish())
+    }
+
+    /// Build a key directly from a database id.
+    pub fn from_id(id: i64) -> Self {
+        // Spread the bits so adjacent ids don't all map to a
+        // contiguous slice of the texture atlas (if we ever use
+        // one). The 0x9E3779B97F4A7C15 constant is the golden
+        // ratio fractional; the multiply mixes the bits.
+        CacheKey((id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    }
+}
+
+impl std::fmt::Display for CacheKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Draw a single thumbnail card. Reserves its own space; the caller
+/// just calls this inside a `ui.horizontal` (or any other layout
+/// context) and we take care of the rect.
+///
+/// If `config.selectable` is `true`, a click toggles
+/// `config.selected` in place. Otherwise the card is hover-only and
+/// `config.selected` is left alone.
+pub fn thumb_card<K>(
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    cache_key: K,
+    config: &mut ThumbCardConfig,
+    thumb_bytes: Option<&ThumbnailBytes>,
+    full_path: &str,
+    textures: &Mutex<HashMap<K, egui::TextureHandle>>,
+) -> CardResponse
+where
+    K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
+{
+    let cell_w = config.cell_w;
+    let image_h = cell_w * (CARD_ASPECT_H / CARD_ASPECT_W);
+    let card_h = image_h + LABEL_H + INNER_MARGIN * 2.0;
+    let card_size = egui::vec2(cell_w, card_h);
+
+    // Reserve space for the card and make the whole thing clickable
+    // when the caller asked for selectable cards.
+    let sense = if config.selectable {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (card_rect, response) = ui.allocate_exact_size(card_size, sense);
+    let response = response.on_hover_text(full_path);
+
+    // Toggle the selection in place if the user clicked and the
+    // card is selectable. `in_catalog` rows are pinned to
+    // unselected -- the import dialog relies on that to keep
+    // duplicates out of the import set.
+    if response.clicked() && config.selectable && !config.in_catalog {
+        config.selected = !config.selected;
+    }
+
+    let card_response = CardResponse {
+        clicked: response.clicked(),
+        hovered: response.hovered(),
+    };
+
+    let selected = config.selected && !config.in_catalog;
+    let in_catalog = config.in_catalog;
+
+    // Card background: flat, never tinted by selection. Selection is
+    // signalled *only* by the border.
+    let visuals = ui.style().visuals.clone();
+    ui.painter().rect_filled(
+        card_rect,
+        egui::CornerRadius::same(4),
+        visuals.widgets.noninteractive.bg_fill,
+    );
+
+    // Border: thicker + selection-coloured when selected, dim hover
+    // ring on pointer-over, faint otherwise.
+    let border_color = if selected {
+        visuals.selection.stroke.color
+    } else if response.hovered() {
+        visuals.widgets.hovered.bg_stroke.color
+    } else {
+        visuals.widgets.noninteractive.bg_stroke.color
+    };
+    let border_width = if selected { 2.0 } else { 1.0 };
+    ui.painter().rect_stroke(
+        card_rect,
+        egui::CornerRadius::same(4),
+        egui::Stroke::new(border_width, border_color),
+        egui::StrokeKind::Inside,
+    );
+
+    // Image area: 3:2, leaving room for the label strip.
+    let image_rect = egui::Rect::from_min_size(
+        card_rect.min + egui::vec2(INNER_MARGIN, INNER_MARGIN),
+        egui::vec2(cell_w - INNER_MARGIN * 2.0, image_h),
+    );
+
+    draw_thumbnail(ctx, ui, cache_key, thumb_bytes, image_rect, textures);
+
+    // Label strip.
+    let label_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            card_rect.min.x + INNER_MARGIN,
+            image_rect.max.y + 1.0,
+        ),
+        egui::vec2(cell_w - INNER_MARGIN * 2.0, LABEL_H),
+    );
+    let label_color = if in_catalog {
+        visuals.weak_text_color()
+    } else {
+        visuals.text_color()
+    };
+    let label_text = if in_catalog {
+        "already imported".to_string()
+    } else {
+        config.label_override.clone().unwrap_or_else(|| {
+            // Default to the file name component of the full path.
+            std::path::Path::new(full_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string()
+        })
+    };
+    ui.painter().text(
+        label_rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        label_text,
+        egui::FontId::proportional(12.0),
+        label_color,
+    );
+
+    card_response
+}
+
+/// Draw the thumbnail itself (or a placeholder if not loaded yet).
+/// Letterboxes the image into the 3:2 frame so non-3:2 sources
+/// (square scans, video frames, 1:1 crops) don't distort.
+pub fn draw_thumbnail<K>(
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    cache_key: K,
+    thumb_bytes: Option<&ThumbnailBytes>,
+    image_rect: egui::Rect,
+    textures: &Mutex<HashMap<K, egui::TextureHandle>>,
+) where
+    K: std::hash::Hash + Eq + Copy + std::fmt::Display,
+{
+    if let Some(bytes) = thumb_bytes {
+        let mut cache = textures.lock().unwrap();
+        cache.entry(cache_key).or_insert_with(|| {
+            let color = egui::ColorImage::from_rgba_unmultiplied(
+                [bytes.width as usize, bytes.height as usize],
+                &bytes.rgba,
+            );
+            ctx.load_texture(
+                format!("thumb-{cache_key}"),
+                color,
+                egui::TextureOptions::LINEAR,
+            )
+        });
+        if let Some(tex) = cache.get(&cache_key) {
+            let src_w = tex.size()[0] as f32;
+            let src_h = tex.size()[1] as f32;
+            let dest = fit_inside(image_rect, src_w, src_h);
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            // Letterbox background.
+            ui.painter().rect_filled(
+                image_rect,
+                egui::CornerRadius::same(2),
+                ui.style().visuals.widgets.noninteractive.bg_fill,
+            );
+            ui.painter().image(tex.id(), dest, uv, egui::Color32::WHITE);
+        }
+    } else {
+        // Still loading: paint an animated spinner directly in the
+        // image rect. Using `Spinner::paint_at` (instead of
+        // `ui.add(Spinner::new())` or `allocate_new_ui`) keeps the
+        // spinner in pure paint space: it doesn't consume any
+        // layout in the parent ui, so the label below the image
+        // stays put when the thumbnail loads. The spinner itself
+        // centres itself inside its rect (it draws at
+        // `rect.center()`), so H+V centring is automatic.
+        //
+        // `paint_at` ignores the `.size(...)` setter and instead
+        // fills the whole rect -- so we build a small square
+        // centred in `image_rect` for it. 20 px is a comfortable
+        // size that doesn't overwhelm the 156 px cell.
+        const SPINNER_SIZE: f32 = 20.0;
+        let spinner_rect = egui::Rect::from_center_size(image_rect.center(), egui::vec2(SPINNER_SIZE, SPINNER_SIZE));
+        egui::Spinner::new().paint_at(ui, spinner_rect);
+    }
+}
+
+/// Compute a rectangle that fits `src_w x src_h` inside `outer`,
+/// preserving aspect ratio and centring the result.
+pub fn fit_inside(outer: egui::Rect, src_w: f32, src_h: f32) -> egui::Rect {
+    if src_w <= 0.0 || src_h <= 0.0 {
+        return outer;
+    }
+    let outer_w = outer.width();
+    let outer_h = outer.height();
+    let scale = (outer_w / src_w).min(outer_h / src_h);
+    let w = src_w * scale;
+    let h = src_h * scale;
+    let x = outer.min.x + (outer_w - w) * 0.5;
+    let y = outer.min.y + (outer_h - h) * 0.5;
+    egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h))
+}
+
+/// Per-item info needed to render a grid cell. The grid helper takes
+/// a slice of these and renders the rows. The caller supplies a
+/// stable cache key for each cell via the `key_for` closure in
+/// [`show_thumb_grid`] so a refresh that re-orders the list doesn't
+/// invalidate loaded textures.
+#[derive(Debug, Clone)]
+pub struct GridItem {
+    /// Stable id for this cell (e.g. `Photo::id`). The import dialog
+    /// leaves this as `None` and hashes the path. The library
+    /// sets it so the GPU texture survives catalog refreshes.
+    pub id: Option<i64>,
+    /// Full file path. Used for hover and as the default label.
+    pub full_path: String,
+    /// Decoded thumbnail bytes, or `None` while the worker is
+    /// still loading.
+    pub thumb_bytes: Option<ThumbnailBytes>,
+    /// Visual / behavioural config for this cell.
+    pub config: ThumbCardConfig,
+}
+
+/// Render a centred, row-by-row grid of items. Each row is a
+/// `ui.horizontal` block so the partial trailing row stays at the
+/// same horizontal offset as the full rows above it.
+pub fn show_thumb_grid<K, F>(
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    items: &mut [GridItem],
+    textures: &Mutex<HashMap<K, egui::TextureHandle>>,
+    max_height: f32,
+    key_for: F,
+) where
+    K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
+    F: Fn(&GridItem) -> K,
+{
+    let layout = compute_grid(ui);
+    let n = items.len();
+
+    let scroll = egui::ScrollArea::vertical()
+        .max_height(max_height)
+        .auto_shrink([false, false]);
+    scroll.show(ui, |ui| {
+        for (row_idx, row_start) in (0..n).step_by(layout.cells_per_row).enumerate() {
+            let row_end = (row_start + layout.cells_per_row).min(n);
+            let in_row = row_end - row_start;
+            let row_w = in_row as f32 * layout.cell_pitch - COL_SPACING;
+            let available = ui.available_width();
+            // Use the wider of "what a full row needs" and "what
+            // this row actually has" so the centering math stays
+            // stable across the full/partial transition.
+            let reference_w = layout.full_row_w.max(row_w);
+            let pad = ((available - reference_w) * 0.5).max(0.0);
+
+            let resp = ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.spacing_mut().item_spacing.x = COL_SPACING;
+                for item in items[row_start..row_end].iter_mut() {
+                    let bytes = item.thumb_bytes.as_ref();
+                    let path = item.full_path.clone();
+                    let cache_key = key_for(item);
+                    let _ = thumb_card(
+                        ctx,
+                        ui,
+                        cache_key,
+                        &mut item.config,
+                        bytes,
+                        &path,
+                        textures,
+                    );
+                }
+            });
+            let _ = resp;
+            // Spacing between rows.
+            if row_idx + 1 < n.div_ceil(layout.cells_per_row) {
+                ui.add_space(ROW_SPACING);
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_inside_preserves_aspect_and_centers() {
+        let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let r = fit_inside(outer, 300.0, 200.0);
+        assert!((r.width() - 100.0).abs() < 0.01);
+        assert!((r.height() - 100.0 * (2.0 / 3.0)).abs() < 0.01);
+        assert_eq!(r.min.x, 0.0);
+        assert!(r.min.y > 0.0);
+    }
+
+    #[test]
+    fn fit_inside_letterboxes_tall_sources() {
+        let outer = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let r = fit_inside(outer, 200.0, 200.0);
+        assert!((r.width() - 100.0).abs() < 0.01);
+        assert!((r.height() - 100.0).abs() < 0.01);
+        assert_eq!(r.min, egui::pos2(0.0, 0.0));
+    }
+
+    #[test]
+    fn card_height_matches_image_plus_label() {
+        let h = card_height(THUMB_CELL);
+        // 156 * (2/3) + 18 + 8 = 104 + 18 + 8 = 130
+        assert!((h - 130.0).abs() < 0.5);
+    }
+}

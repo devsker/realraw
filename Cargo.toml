@@ -1,0 +1,32 @@
+[package]
+name = "realraw"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "realraw"
+path = "src/lib.rs"
+
+[[bin]]
+name = "realraw"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+refinery = { version = "0.8", features = ["rusqlite"] }
+rfd = "0.15"
+directories = "5"
+time = { version = "0.3", features = ["formatting", "macros"] }
+thiserror = "1"
+kamadak-exif = "0.6"
+sha1 = "0.11"
+walkdir = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "rayon"] }
+jpeg-decoder = "0.3"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
