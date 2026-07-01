@@ -19,3 +19,6 @@ pub mod demos;
 pub mod import;
 pub mod task;
 pub mod thumb_grid;
+
+/// Raw bytes of the application logo / icon (2048×2048 PNG).
+pub static ICON_PNG: &[u8] = include_bytes!("../assets/icon-2048.png");

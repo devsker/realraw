@@ -1,8 +1,13 @@
-use eframe::egui;
+use eframe::egui::{self, ViewportBuilder};
 use realraw::app::App;
 
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let icon = eframe::icon_data::from_png_bytes(realraw::ICON_PNG)
+        .expect("Failed to decode app icon");
+    let options = eframe::NativeOptions {
+        viewport: ViewportBuilder::default().with_icon(icon),
+        ..Default::default()
+    };
     eframe::run_native(
         "realraw",
         options,

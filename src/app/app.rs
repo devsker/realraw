@@ -52,6 +52,9 @@ pub struct App {
     /// closes so we can defer the library refresh until the background
     /// import tasks actually finish writing to the catalog.
     import_summary_rx: Option<std::sync::mpsc::Receiver<ImportSummary>>,
+
+    /// Logo texture for the About dialog.
+    logo: Option<egui::TextureHandle>,
 }
 
 impl Default for App {
@@ -90,6 +93,7 @@ impl Default for App {
             library_needs_refresh: false,
             last_dialog_phase: None,
             import_summary_rx: None,
+            logo: None,
         }
     }
 }
@@ -326,7 +330,23 @@ fn render_central(app: &mut App, ctx: &egui::Context) {
 }
 
 fn render_about_modal(app: &mut App, ctx: &egui::Context) {
+    let logo = app.logo.get_or_insert_with(|| {
+        let img = image::load_from_memory(include_bytes!("../../assets/icon-64.png"))
+            .expect("Failed to decode logo");
+        let rgba = img.to_rgba8();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [64, 64],
+            rgba.as_raw(),
+        );
+        ctx.load_texture("logo", color_image, egui::TextureOptions::LINEAR)
+    });
+
     let response = egui::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space(8.0);
+            ui.image(&*logo);
+            ui.add_space(8.0);
+        });
         ui.heading("realraw");
         ui.label("An open source Lightroom alternative.");
         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));

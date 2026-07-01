@@ -1,5 +1,9 @@
 # realraw
 
+<p align="center">
+  <img src="assets/icon-2048.png" width="200" alt="realraw logo" />
+</p>
+
 An open-source Lightroom alternative, written in Rust.
 
 Realraw is a native desktop photo management app with an SQLite-backed catalog,
