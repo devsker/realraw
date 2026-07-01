@@ -379,33 +379,34 @@ fn render_central(app: &mut App, ctx: &egui::Context) {
 }
 
 fn render_about_modal(app: &mut App, ctx: &egui::Context) {
-    let logo = app.logo.get_or_insert_with(|| {
-        let img = image::load_from_memory(include_bytes!("../../assets/icon-64.png"))
-            .expect("Failed to decode logo");
-        let rgba = img.to_rgba8();
-        let color_image = egui::ColorImage::from_rgba_unmultiplied(
-            [64, 64],
-            rgba.as_raw(),
-        );
-        ctx.load_texture("logo", color_image, egui::TextureOptions::LINEAR)
-    });
-
     let response = egui::Modal::new(egui::Id::new("about_modal")).show(ctx, |ui| {
-        ui.vertical_centered(|ui| {
+        let logo = app.logo.get_or_insert_with(|| {
+            let img = image::load_from_memory(include_bytes!("../../assets/icon-64.png"))
+                .expect("Failed to decode logo");
+            let rgba = img.to_rgba8();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [64, 64],
+                rgba.as_raw(),
+            );
+            ctx.load_texture("logo", color_image, egui::TextureOptions::LINEAR)
+        });
+    
+    ui.vertical_centered(|ui| {
             ui.add_space(8.0);
             ui.image(&*logo);
             ui.add_space(8.0);
-        });
-        ui.heading("realraw");
-        ui.label("An open source Lightroom alternative.");
-        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-        ui.add_space(8.0);
-        ui.hyperlink_to("github.com/devsker/realraw", "https://github.com/devsker/realraw");
-        ui.add_space(8.0);
-        ui.vertical_centered(|ui| {
-            if ui.button("Close").clicked() {
-                app.show_about = false;
-            }
+            ui.heading("realraw");
+            ui.label("An open source Lightroom alternative.");
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            ui.add_space(8.0);
+            ui.hyperlink_to("github.com/devsker/realraw", "https://github.com/devsker/realraw");
+            ui.hyperlink_to("codeberg.org/sker/realraw", "https://codeberg.org/devsker/realraw");
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                if ui.button("Close").clicked() {
+                    app.show_about = false;
+                }
+            });
         });
     });
     if response.should_close() {
