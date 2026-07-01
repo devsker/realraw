@@ -42,6 +42,18 @@ hex = "0.4"
 rawler = "0.7"
 egui-phosphor = "0.9"
 
+[package.metadata.deb]
+maintainer = "marcelsker"
+depends = "$auto"
+section = "graphics"
+priority = "optional"
+assets = [
+    ["target/release/realraw", "usr/bin/", "755"],
+    ["assets/icon-2048.png", "usr/share/icons/hicolor/2048x2048/apps/realraw.png", "644"],
+    ["assets/icon-64.png", "usr/share/icons/hicolor/64x64/apps/realraw.png", "644"],
+    ["assets/realraw.desktop", "usr/share/applications/", "644"],
+]
+
 [build-dependencies]
 embed-resource = "3"
 

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=realraw
+Comment=An open source Lightroom alternative
+Exec=realraw
+Icon=realraw
+Terminal=false
+Type=Application
+Categories=Graphics;Photography;
