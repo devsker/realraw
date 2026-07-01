@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use directories::UserDirs;
+use directories::{ProjectDirs, UserDirs};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use refinery::embed_migrations;
@@ -161,6 +161,30 @@ impl Catalog {
     /// collections, ...) for CRUD operations.
     pub fn pool(&self) -> &Pool<SqliteConnectionManager> {
         &self.pool
+    }
+
+    /// Directory used to persist app state (last catalog path, etc.).
+    pub fn data_dir() -> Option<PathBuf> {
+        ProjectDirs::from("com", "realraw", "realraw")
+            .map(|d| d.data_dir().to_path_buf())
+    }
+
+    /// Save `path` as the last-opened catalog so it can be restored
+    /// on the next launch.
+    pub fn save_last_path(path: &Path) {
+        if let Some(dir) = Self::data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("last_catalog.txt"), path.to_string_lossy().as_bytes());
+        }
+    }
+
+    /// Load the last-opened catalog path, if any. Returns `None` if
+    /// the file doesn't exist or couldn't be read.
+    pub fn load_last_path() -> Option<PathBuf> {
+        let path = Self::data_dir()?.join("last_catalog.txt");
+        let content = std::fs::read_to_string(path).ok()?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() { None } else { Some(PathBuf::from(trimmed)) }
     }
 }
 

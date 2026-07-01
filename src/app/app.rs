@@ -77,36 +77,43 @@ impl Default for App {
                 .unwrap_or_else(|| PathBuf::from("."))
         };
 
+        let last = Catalog::load_last_path()
+            .and_then(|p| Catalog::open_existing(&p).ok().map(|c| (p, c)));
         let (catalog, catalog_counts, catalog_error, show_setup_dialog, setup_name, setup_dir, setup_error) =
-            match Catalog::default_path() {
-                Ok(p) => match Catalog::open_existing(&p) {
-                    Ok(c) => {
-                        let counts = c.counts().ok();
-                        (Some(Arc::new(c)), counts, None, false, String::new(), PathBuf::new(), None)
-                    }
-                    Err(e) => {
-                        let is_not_found =
-                            matches!(&e, crate::catalog::CatalogError::NotFound(_));
-                        (
-                            None,
-                            None,
-                            if is_not_found { None } else { Some(e.to_string()) },
-                            true,
-                            "realraw".to_string(),
-                            picture_dir(),
-                            None,
-                        )
-                    }
-                },
-                Err(e) => (
-                    None,
-                    None,
-                    Some(e.to_string()),
-                    true,
-                    "realraw".to_string(),
-                    picture_dir(),
-                    None,
-                ),
+            if let Some((_path, cat)) = last {
+                let counts = cat.counts().ok();
+                (Some(Arc::new(cat)), counts, None, false, String::new(), PathBuf::new(), None)
+            } else {
+                match Catalog::default_path() {
+                    Ok(p) => match Catalog::open_existing(&p) {
+                        Ok(c) => {
+                            let counts = c.counts().ok();
+                            (Some(Arc::new(c)), counts, None, false, String::new(), PathBuf::new(), None)
+                        }
+                        Err(e) => {
+                            let is_not_found =
+                                matches!(&e, crate::catalog::CatalogError::NotFound(_));
+                            (
+                                None,
+                                None,
+                                if is_not_found { None } else { Some(e.to_string()) },
+                                true,
+                                "realraw".to_string(),
+                                picture_dir(),
+                                None,
+                            )
+                        }
+                    },
+                    Err(e) => (
+                        None,
+                        None,
+                        Some(e.to_string()),
+                        true,
+                        "realraw".to_string(),
+                        picture_dir(),
+                        None,
+                    ),
+                }
             };
         let mut library = LibraryPage::default();
         if let Some(cat) = catalog.as_ref() {
@@ -417,9 +424,9 @@ fn render_about_modal(app: &mut App, ctx: &egui::Context) {
 fn render_setup_dialog(app: &mut App, ctx: &egui::Context) {
     let mut catalog_created = false;
 
-    let response = egui::Modal::new(egui::Id::new("setup_dialog")).show(ctx, |ui| {
+    egui::Modal::new(egui::Id::new("setup_dialog")).show(ctx, |ui| {
         ui.heading("Welcome to realraw");
-        ui.label("Create your first collection to get started.");
+        ui.label("Create your first collection or open an existing one.");
         ui.add_space(12.0);
 
         ui.horizontal(|ui| {
@@ -459,6 +466,7 @@ fn render_setup_dialog(app: &mut App, ctx: &egui::Context) {
                 let path = dir.join("catalog.sqlite");
                 match Catalog::create(&path) {
                     Ok(cat) => {
+                        Catalog::save_last_path(cat.path());
                         let counts = cat.counts().ok();
                         app.catalog = Some(Arc::new(cat));
                         app.catalog_counts = counts;
@@ -471,25 +479,44 @@ fn render_setup_dialog(app: &mut App, ctx: &egui::Context) {
                     }
                 }
             }
-            if ui.button("Cancel").clicked() {
-                catalog_created = true;
-            }
         });
+
+        ui.add_space(4.0);
+
+        if ui.button("Open Existing Collection...").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("SQLite", &["sqlite", "db"])
+                .pick_file()
+            {
+                match Catalog::open(&path) {
+                    Ok(cat) => {
+                        Catalog::save_last_path(cat.path());
+                        let counts = cat.counts().ok();
+                        app.catalog = Some(Arc::new(cat));
+                        app.catalog_counts = counts;
+                        app.catalog_error = None;
+                        app.setup_error = None;
+                        catalog_created = true;
+                    }
+                    Err(e) => {
+                        app.setup_error = Some(e.to_string());
+                    }
+                }
+            }
+        }
     });
 
-    if response.should_close() || catalog_created {
-        if app.catalog.is_some() {
-            if let Some(cat) = app.catalog.as_ref() {
-                app.library.refresh(cat, None);
-            }
-            app.library_last_refresh_mtime_ms = app
-                .catalog
-                .as_ref()
-                .and_then(|c| std::fs::metadata(c.path()).ok())
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64);
+    if catalog_created {
+        if let Some(cat) = app.catalog.as_ref() {
+            app.library.refresh(cat, None);
         }
+        app.library_last_refresh_mtime_ms = app
+            .catalog
+            .as_ref()
+            .and_then(|c| std::fs::metadata(c.path()).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64);
         app.setup_error = None;
         app.show_setup_dialog = false;
     }
@@ -573,6 +600,7 @@ fn file_menu(ui: &mut egui::Ui, app: &mut App) {
 fn try_open_catalog(app: &mut App, path: &std::path::Path) {
     match Catalog::open(path) {
         Ok(cat) => {
+            Catalog::save_last_path(cat.path());
             let counts = cat.counts().ok();
             app.catalog_error = None;
             app.catalog_counts = counts;
@@ -587,6 +615,7 @@ fn try_open_catalog(app: &mut App, path: &std::path::Path) {
 fn try_new_catalog(app: &mut App, path: &std::path::Path) {
     match Catalog::create(path) {
         Ok(cat) => {
+            Catalog::save_last_path(cat.path());
             let counts = cat.counts().ok();
             app.catalog_error = None;
             app.catalog_counts = counts;
