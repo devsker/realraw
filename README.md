@@ -45,6 +45,23 @@ On first launch, a default catalog is created at `~/Pictures/realraw/catalog.sql
 cargo test
 ```
 
+## Packaging
+
+The binary can be packaged into platform-specific installers via `scripts/package.sh`:
+
+| Command | Requires | Output |
+|---------|----------|--------|
+| `./scripts/package.sh app-macos` | `cargo install cargo-bundle` | `.app` bundle |
+| `./scripts/package.sh dmg` | `cargo-bundle` + `brew install create-dmg` | `.dmg` disk image |
+| `./scripts/package.sh deb` | `cargo install cargo-deb` | `.deb` (Debian/Ubuntu) |
+| `./scripts/package.sh rpm` | `cargo-bundle` | `.rpm` (Fedora/RHEL) |
+| `./scripts/package.sh appimage` | `cargo install cargo-appimage` | AppImage (any Linux) |
+| `./scripts/package.sh exe` | nothing extra | `.exe` with icon embedded |
+| `./scripts/package.sh all` | all of the above | runs available commands for the current OS |
+
+The Windows `.exe` icon is embedded automatically at compile time via `build.rs`.  
+The macOS `.icns` and Windows `.ico` are generated from `assets/icon-2048.png`.
+
 ## License
 
 AGPL-3.0-or-later. See [`LICENSE`](LICENSE).
