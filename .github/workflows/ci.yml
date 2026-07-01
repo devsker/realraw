@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Allows appimagetool to run on systems without FUSE
+  APPIMAGE_EXTRACT_AND_RUN: 1
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --release
+
+  package:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS
+          - os: ubuntu-latest
+            label: Linux
+          - os: windows-latest
+            label: Windows
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install packaging tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cargo install cargo-bundle
+          brew install create-dmg
+
+      - name: Install packaging tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libfuse2 2>/dev/null || true
+          cargo install cargo-bundle
+          cargo install cargo-deb
+          cargo install cargo-appimage
+
+      - name: Build and package (macOS)
+        if: runner.os == 'macOS'
+        run: ./scripts/package.sh all
+
+      - name: Build and package (Linux)
+        if: runner.os == 'Linux'
+        run: ./scripts/package.sh all
+
+      - name: Build and package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: ./scripts/package.sh all
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: realraw-${{ matrix.label }}
+          path: |
+            target/release/realraw.exe
+            target/release/*.dmg
+            target/release/*.deb
+            target/release/*.AppImage
+            target/release/bundle/**/*.app
+            target/release/bundle/**/*.rpm
+          compression-level: 0
+          if-no-files-found: ignore
