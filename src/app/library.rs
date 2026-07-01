@@ -16,21 +16,109 @@ use std::sync::Mutex;
 use std::thread;
 
 use eframe::egui;
+use time::OffsetDateTime;
 
+use crate::catalog::thumbnail_cache;
 use crate::catalog::{Catalog, Photo};
-use crate::import::thumbnail::extract_thumbnail;
 use crate::thumb_grid::{self, GridItem, ThumbCardConfig, ThumbnailBytes};
 
 /// Maximum number of outstanding thumbnail requests at any time.
 /// Keeps the disk + decode load under control on big libraries.
 const MAX_INFLIGHT_THUMBS: usize = 16;
+/// Maximum times we'll retry a failed thumbnail before giving up
+/// and showing the error permanently.
+const MAX_THUMB_RETRIES: u32 = 3;
 /// Vertical scroll area height for the library grid.
 const SCROLL_MAX_HEIGHT: f32 = 6_000.0;
+
+/// Group consecutive photos by calendar day. Returns groups in
+/// display order, each with a formatted date label.
+fn group_by_date(photos: &[Photo]) -> Vec<(String, Vec<&Photo>)> {
+    let mut groups: Vec<(String, Vec<&Photo>)> = Vec::new();
+
+    for photo in photos {
+        let ts = photo.date_taken.unwrap_or(photo.imported_at);
+        let dt = OffsetDateTime::from_unix_timestamp(ts).unwrap();
+        let label = format!("{} {}, {}", dt.month(), dt.day(), dt.year());
+
+        if groups.last().map(|(l, _)| l.as_str()) != Some(label.as_str()) {
+            groups.push((label, Vec::new()));
+        }
+        groups.last_mut().unwrap().1.push(photo);
+    }
+
+    groups
+}
+
+/// Render an inline divider with the date label embedded in a
+/// horizontal line: ──── July 1, 2026 ────
+fn render_date_divider(ui: &mut egui::Ui, label: &str) {
+    let height = 24.0;
+    let (rect, _response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+
+    let painter = ui.painter();
+    let center_y = rect.center().y;
+    let visuals = ui.style().visuals.clone();
+    let line_color = visuals.widgets.noninteractive.bg_stroke.color;
+    let text_color = visuals.weak_text_color();
+    let font_id = egui::FontId::proportional(12.0);
+
+    let galley = painter.layout_no_wrap(label.to_string(), font_id.clone(), text_color);
+    let text_w = galley.size().x;
+    let text_h = galley.size().y;
+    let pad = 8.0;
+    let line_y = center_y.floor() + 0.5;
+
+    // Left line segment
+    painter.line_segment(
+        [
+            egui::pos2(rect.min.x, line_y),
+            egui::pos2(rect.min.x + (rect.width() - text_w) / 2.0 - pad, line_y),
+        ],
+        egui::Stroke::new(1.0, line_color),
+    );
+
+    // Right line segment
+    painter.line_segment(
+        [
+            egui::pos2(rect.min.x + (rect.width() + text_w) / 2.0 + pad, line_y),
+            egui::pos2(rect.max.x, line_y),
+        ],
+        egui::Stroke::new(1.0, line_color),
+    );
+
+    // Background behind text masks the line
+    let bg_fill = visuals.widgets.noninteractive.bg_fill;
+    painter.rect_filled(
+        egui::Rect::from_center_size(
+            egui::pos2(rect.min.x + rect.width() / 2.0, center_y),
+            egui::vec2(text_w + 4.0, text_h + 2.0),
+        ),
+        egui::CornerRadius::same(2),
+        bg_fill,
+    );
+
+    // Draw text
+    painter.text(
+        egui::pos2(rect.min.x + rect.width() / 2.0, center_y),
+        egui::Align2::CENTER_CENTER,
+        label,
+        font_id,
+        text_color,
+    );
+}
 
 /// State for the main library page.
 pub struct LibraryPage {
     /// Photos currently displayed, ordered by `imported_at` desc.
     pub photos: Vec<Photo>,
+    /// `true` while a background import is running. The empty-state
+    /// message shows a spinner + "Importing Photos…" instead of
+    /// the default "Library is empty" hint.
+    pub importing: bool,
     /// Per-photo thumbnail state keyed by `Photo::id` (stable
     /// across refreshes). Holding the state in a `HashMap` means
     /// re-reading the catalog doesn't wipe in-flight work -- if a
@@ -55,12 +143,17 @@ pub struct LibraryPage {
 /// workers' results can land in the right slot even if the user
 /// scrolls, the import dialog re-runs, or the catalog mtime ticks
 /// during a bulk import.
+#[derive(Default)]
 struct ThumbState {
     bytes: Option<ThumbnailBytes>,
     error: Option<String>,
     /// `true` once we've sent the file's path to the thumbnail
     /// worker. Used to avoid spawning duplicate workers.
     requested: bool,
+    /// Number of failed attempts so far. Once this reaches
+    /// [`MAX_THUMB_RETRIES`] we stop retrying and show the error
+    /// text permanently.
+    attempts: u32,
 }
 
 struct ThumbResult {
@@ -74,6 +167,7 @@ impl Default for LibraryPage {
         let (thumb_tx, thumb_rx) = channel();
         Self {
             photos: Vec::new(),
+            importing: false,
             thumbs: HashMap::new(),
             textures: Mutex::new(HashMap::new()),
             thumb_tx,
@@ -101,11 +195,7 @@ impl LibraryPage {
                 // Allocate a fresh ThumbState for any new photo
                 // id. Existing entries are untouched.
                 for p in &self.photos {
-                    self.thumbs.entry(p.id).or_insert(ThumbState {
-                        bytes: None,
-                        error: None,
-                        requested: false,
-                    });
+                    self.thumbs.entry(p.id).or_default();
                 }
                 // Drop the per-photo state for photos that have
                 // been removed from the catalog.
@@ -131,26 +221,36 @@ impl LibraryPage {
         }
     }
 
-    /// Drain pending thumbnail results from background workers.
-    pub fn pump_events(&mut self) {
+    /// Drain pending thumbnail results from background workers and
+    /// update thumbnail_status in the catalog.
+    pub fn pump_events(&mut self, catalog: &Catalog) {
         while let Ok(r) = self.thumb_rx.try_recv() {
             self.inflight_thumbs.fetch_sub(1, Ordering::Relaxed);
-            // Find the per-photo state for this id. If the photo
-            // was removed from the catalog between request and
-            // delivery, the state is gone and we just drop the
-            // result on the floor.
             if let Some(state) = self.thumbs.get_mut(&r.photo_id) {
                 match r.result {
                     Ok(bytes) => {
                         state.bytes = Some(bytes);
                         state.error = None;
-                        // Drop any cached texture; the next render
-                        // pass will rebuild it from the new bytes.
                         let key = thumb_grid::CacheKey::from_id(r.photo_id);
                         self.textures.lock().unwrap().remove(&key);
+                        // Mark the thumbnail as ready in the DB so
+                        // subsequent launches skip this photo.
+                        if let Ok(conn) = catalog.pool().get() {
+                            let _ = conn.execute(
+                                "UPDATE photos SET thumbnail_status = 1 WHERE id = ?1",
+                                [r.photo_id],
+                            );
+                        }
                     }
                     Err(e) => {
+                        eprintln!(
+                            "thumb failed for photo {} (attempt {}): {e}",
+                            r.photo_id,
+                            state.attempts + 1,
+                        );
                         state.error = Some(e);
+                        state.requested = false;
+                        state.attempts = state.attempts.saturating_add(1);
                     }
                 }
             }
@@ -162,8 +262,9 @@ impl LibraryPage {
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
+        catalog: &Catalog,
     ) -> Option<usize> {
-        self.pump_events();
+        self.pump_events(catalog);
 
         if let Some(err) = &self.last_error {
             ui.colored_label(egui::Color32::LIGHT_RED, err);
@@ -172,137 +273,163 @@ impl LibraryPage {
 
         if self.photos.is_empty() {
             ui.vertical_centered(|ui| {
-                ui.add_space(80.0);
-                ui.heading("Library is empty");
-                ui.label("Use File → Import Photos… to add some.");
+                if self.importing {
+                    ui.add_space(ui.available_height() / 3.0);
+                    ui.heading("Importing Photos...");
+                } else {
+                    ui.add_space(80.0);
+                    ui.heading("Library is empty");
+                    let arrow = egui_phosphor::variants::regular::ARROW_RIGHT;
+                    ui.label(format!("Use File {arrow} Import Photos to add some."));
+                }
             });
             return None;
         }
 
-        // Top status row: photo count + a "loading…" hint while
-        // thumbs are in flight. Keeps the grid itself uncluttered.
-        ui.horizontal(|ui| {
-            ui.strong(format!("{} photos", self.photos.len()));
-            if self.inflight_thumbs.load(Ordering::Relaxed) > 0 {
-                ui.spinner();
-                ui.weak("loading thumbnails…");
-            }
-        });
-        ui.separator();
+        // Pre-load cached thumbnails from disk before spawning
+        // workers. This prevents the infinite spinner on restart
+        // when the disk cache already has the thumbnail.
+        self.preload_cached_thumbs(catalog);
 
         // Request thumbnails for every photo that doesn't have one
         // yet. The `inflight_thumbs` counter already caps the
         // number of in-flight extractions at MAX_INFLIGHT_THUMBS,
         // so this just keeps the work queue topped up.
         let layout = thumb_grid::compute_grid(ui);
-        self.request_thumbs();
+        self.request_thumbs(catalog);
 
-        // Project photos into GridItems for the shared renderer.
-        let mut items: Vec<GridItem> = self
-            .photos
-            .iter()
-            .map(|p| {
-                let label = p
-                    .file_format
-                    .clone()
-                    .unwrap_or_else(|| display_name_from_path(&p.path));
-                let bytes = self
-                    .thumbs
-                    .get(&p.id)
-                    .and_then(|s| s.bytes.clone());
-                GridItem {
-                    id: Some(p.id),
-                    full_path: p.path.clone(),
-                    thumb_bytes: bytes,
-                    config: ThumbCardConfig {
-                        cell_w: layout.cell_w,
-                        // Library cards are hover-only for now;
-                        // single-click is a no-op until we wire up
-                        // a loupe view.
-                        selectable: false,
-                        selected: false,
-                        in_catalog: false,
-                        label_override: Some(label),
+        // Group photos by calendar day and render each group under
+        // an inline date divider.
+        let groups = group_by_date(&self.photos);
+
+        let scroll = egui::ScrollArea::vertical()
+            .max_height(SCROLL_MAX_HEIGHT)
+            .auto_shrink([false, false]);
+        scroll.show(ui, |ui| {
+            for (date_label, group_photos) in &groups {
+                render_date_divider(ui, date_label);
+
+                let mut items: Vec<GridItem> = group_photos
+                    .iter()
+                    .map(|p| {
+                        let state = self.thumbs.get(&p.id);
+                        let bytes = state.and_then(|s| s.bytes.clone());
+                        let error = state.and_then(|s| s.error.clone());
+                        GridItem {
+                            id: Some(p.id),
+                            full_path: p.path.clone(),
+                            thumb_bytes: bytes,
+                            thumb_error: error,
+                            config: ThumbCardConfig {
+                                cell_w: layout.cell_w,
+                                selectable: false,
+                                selected: false,
+                                in_catalog: false,
+                                label_override: None,
+                            },
+                        }
+                    })
+                    .collect();
+
+                thumb_grid::show_thumb_rows(
+                    ctx,
+                    ui,
+                    &mut items,
+                    &self.textures,
+                    |item| match item.id {
+                        Some(id) => thumb_grid::CacheKey::from_id(id),
+                        None => thumb_grid::CacheKey::from_path(&item.full_path),
                     },
-                }
-            })
-            .collect();
-
-        // The shared helper doesn't surface the clicked cell back to
-        // us (library cards aren't selectable), so we just call it.
-        // Use the photo's database id as the cache key so a refresh
-        // that re-orders the list (e.g. a new import) doesn't
-        // invalidate the loaded textures.
-        thumb_grid::show_thumb_grid(
-            ctx,
-            ui,
-            &mut items,
-            &self.textures,
-            SCROLL_MAX_HEIGHT,
-            |item| match item.id {
-                Some(id) => thumb_grid::CacheKey::from_id(id),
-                None => thumb_grid::CacheKey::from_path(&item.full_path),
-            },
-        );
-        let _ = items;
+                );
+            }
+        });
         None
+    }
+
+    /// Synchronously load cached thumbnails from disk for all photos
+    /// marked `thumbnail_status == 1`. This prevents the infinite
+    /// spinner on restart: the disk cache is checked before any
+    /// worker is spawned.
+    fn preload_cached_thumbs(&mut self, catalog: &Catalog) {
+        let catalog_dir = catalog.dir();
+        for p in &self.photos {
+            if p.thumbnail_status != 1 {
+                continue;
+            }
+            let state = match self.thumbs.get_mut(&p.id) {
+                Some(s) => s,
+                None => continue,
+            };
+            if state.bytes.is_some() {
+                continue;
+            }
+            if let Some(bytes) = thumbnail_cache::load_thumbnail(catalog_dir, p.id) {
+                state.bytes = Some(bytes);
+            }
+        }
     }
 
     /// Spawn thumbnail workers for every photo that doesn't have
     /// a loaded thumbnail yet, up to `MAX_INFLIGHT_THUMBS` at a
-    /// time. Skips photos that are already in flight.
-    fn request_thumbs(&mut self) {
-        // Snapshot the candidate list so we can release the
-        // `thumbs` borrow before spawning threads.
+    /// time. Skips photos that are already in flight or have
+    /// exhausted [`MAX_THUMB_RETRIES`].
+    ///
+    /// Photos with a stored error are re-queued (up to the retry
+    /// limit): the previous attempt may have failed for a transient
+    /// reason (disk hiccup, file temporarily missing, ...) and we
+    /// should give them a chance to resolve. Once the limit is
+    /// reached the error is shown permanently.
+    fn request_thumbs(&mut self, catalog: &Catalog) {
         let candidates: Vec<(i64, PathBuf)> = self
             .photos
             .iter()
             .filter_map(|p| {
                 let state = self.thumbs.get(&p.id)?;
-                if state.bytes.is_some() || state.error.is_some() || state.requested {
+                if state.bytes.is_some()
+                    || state.requested
+                    || state.attempts >= MAX_THUMB_RETRIES
+                {
                     return None;
                 }
                 Some((p.id, PathBuf::from(&p.path)))
             })
             .collect();
 
+        let catalog_dir = catalog.dir().to_path_buf();
         for (id, path) in candidates {
             if self.inflight_thumbs.load(Ordering::Relaxed) >= MAX_INFLIGHT_THUMBS {
                 break;
             }
             if let Some(state) = self.thumbs.get_mut(&id) {
                 state.requested = true;
+                state.error = None;
             }
             self.inflight_thumbs.fetch_add(1, Ordering::Relaxed);
             let tx = self.thumb_tx.clone();
-            let _ = thread::Builder::new()
+            let catalog_dir = catalog_dir.clone();
+            match thread::Builder::new()
                 .name(format!("lib-thumb-{id}"))
                 .spawn(move || {
-                    let result = extract_thumbnail(&path)
-                        .map(|t| ThumbnailBytes {
-                            width: t.width,
-                            height: t.height,
-                            rgba: t.rgba,
-                        })
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(ThumbResult {
-                        photo_id: id,
-                        result,
-                    });
-                });
+                    let result = match std::panic::catch_unwind(|| {
+                        thumbnail_cache::get_or_generate(&catalog_dir, id, &path)
+                    }) {
+                        Ok(r) => r,
+                        Err(_) => Err("thumbnail worker panicked".to_string()),
+                    };
+                    let _ = tx.send(ThumbResult { photo_id: id, result });
+                }) {
+                Ok(_) => {}
+                Err(_) => {
+                    // Thread spawn failed (e.g. system out of threads).
+                    // Reset state so the photo can be retried later.
+                    if let Some(state) = self.thumbs.get_mut(&id) {
+                        state.requested = false;
+                    }
+                    self.inflight_thumbs.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
         }
     }
-}
-
-/// Derive a display name from an absolute file path: just the file
-/// name component. Used as the default label when the catalog row
-/// doesn't have a `file_format` to show.
-fn display_name_from_path(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("?")
-        .to_string()
 }
 
 #[cfg(test)]
@@ -314,12 +441,6 @@ mod tests {
         let page = LibraryPage::default();
         assert!(page.photos.is_empty());
         assert!(page.thumbs.is_empty());
-    }
-
-    #[test]
-    fn display_name_strips_directories() {
-        assert_eq!(display_name_from_path("/photos/a/b/c.jpg"), "c.jpg");
-        assert_eq!(display_name_from_path("relative/path/x.cr2"), "x.cr2");
     }
 
     /// Refreshing the library with a superset of the existing
@@ -347,9 +468,8 @@ mod tests {
             page.thumbs.insert(
                 p.id,
                 ThumbState {
-                    bytes: None,
-                    error: None,
                     requested: true,
+                    ..Default::default()
                 },
             );
         }
@@ -365,11 +485,9 @@ mod tests {
             },
         );
         for p in &page.photos {
-            page.thumbs.entry(p.id).or_insert(ThumbState {
-                bytes: None,
-                error: None,
-                requested: false,
-            });
+            page.thumbs
+                .entry(p.id)
+                .or_default();
         }
 
         // All three should be present; the new one is fresh, the
@@ -404,9 +522,8 @@ mod tests {
             page.thumbs.insert(
                 p.id,
                 ThumbState {
-                    bytes: None,
-                    error: None,
                     requested: true,
+                    ..Default::default()
                 },
             );
         }
@@ -419,5 +536,98 @@ mod tests {
         assert_eq!(page.thumbs.len(), 1);
         assert!(page.thumbs.contains_key(&2));
         assert!(!page.thumbs.contains_key(&1));
+    }
+
+    /// A failed thumbnail extraction must leave the photo in a
+    /// state that `request_thumbs` can re-pick on the next pass.
+    /// Otherwise the cell would sit at the spinner forever even
+    /// though `inflight_thumbs` has dropped to 0.
+    #[test]
+    fn errored_thumb_can_be_retried() {
+        use crate::catalog::Catalog;
+        use crate::catalog::Photo;
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let cat = Catalog::create(&dir.path().join("t.sqlite")).unwrap();
+        let mut page = LibraryPage {
+            photos: vec![Photo {
+                id: 1,
+                path: "/a/a.jpg".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        page.thumbs.insert(
+            1,
+            ThumbState {
+                requested: true,
+                ..Default::default()
+            },
+        );
+
+        // Simulate a worker reporting failure.
+        let (tx, rx) = std::sync::mpsc::channel();
+        page.thumb_rx = rx;
+        tx.send(ThumbResult {
+            photo_id: 1,
+            result: Err("boom".to_string()),
+        })
+        .unwrap();
+        page.pump_events(&cat);
+
+        // After the error: state has the error message, and both
+        // `requested` and `bytes` are reset so a retry is possible.
+        let state = page.thumbs.get(&1).unwrap();
+        assert!(state.bytes.is_none());
+        assert!(state.error.is_some());
+        assert!(
+            !state.requested,
+            "errored cell must be re-queueable"
+        );
+    }
+
+    /// A successful delivery after a prior error must clear the
+    /// error and mark the photo as done.
+    #[test]
+    fn success_after_error_clears_error() {
+        use crate::catalog::Catalog;
+        use crate::catalog::Photo;
+        use crate::thumb_grid::ThumbnailBytes;
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let cat = Catalog::create(&dir.path().join("t.sqlite")).unwrap();
+        let mut page = LibraryPage {
+            photos: vec![Photo {
+                id: 7,
+                path: "/a/g.jpg".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        page.thumbs.insert(
+            7,
+            ThumbState {
+                error: Some("old failure".into()),
+                requested: true,
+                ..Default::default()
+            },
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        page.thumb_rx = rx;
+        tx.send(ThumbResult {
+            photo_id: 7,
+            result: Ok(ThumbnailBytes {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 255],
+            }),
+        })
+        .unwrap();
+        page.pump_events(&cat);
+
+        let state = page.thumbs.get(&7).unwrap();
+        assert!(state.bytes.is_some());
+        assert!(state.error.is_none());
     }
 }

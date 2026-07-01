@@ -126,11 +126,12 @@ pub fn compute_grid(ui: &egui::Ui) -> GridLayout {
     }
 }
 
-/// Total height of a card (image + label + margin), used for the
-/// vertical scroll area estimate.
-pub fn card_height(cell_w: f32) -> f32 {
+/// Total height of a card (image + optional label + margin), used
+/// for the vertical scroll area estimate. Pass `false` for
+/// `show_label` when the library hides the label strip.
+pub fn card_height(cell_w: f32, show_label: bool) -> f32 {
     let image_h = cell_w * (CARD_ASPECT_H / CARD_ASPECT_W);
-    image_h + LABEL_H + INNER_MARGIN * 2.0
+    image_h + INNER_MARGIN * 2.0 + if show_label { LABEL_H } else { 0.0 }
 }
 
 /// Opaque, hashable cache key for a cell's GPU texture. The library
@@ -174,12 +175,14 @@ impl std::fmt::Display for CacheKey {
 /// If `config.selectable` is `true`, a click toggles
 /// `config.selected` in place. Otherwise the card is hover-only and
 /// `config.selected` is left alone.
+#[allow(clippy::too_many_arguments)]
 pub fn thumb_card<K>(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
     cache_key: K,
     config: &mut ThumbCardConfig,
     thumb_bytes: Option<&ThumbnailBytes>,
+    thumb_error: Option<&str>,
     full_path: &str,
     textures: &Mutex<HashMap<K, egui::TextureHandle>>,
 ) -> CardResponse
@@ -188,7 +191,10 @@ where
 {
     let cell_w = config.cell_w;
     let image_h = cell_w * (CARD_ASPECT_H / CARD_ASPECT_W);
-    let card_h = image_h + LABEL_H + INNER_MARGIN * 2.0;
+    // Only reserve space for the label strip when there is actually
+    // text to show (label_override = None means no label at all).
+    let show_label = config.label_override.is_some() || config.in_catalog;
+    let card_h = image_h + INNER_MARGIN * 2.0 + if show_label { LABEL_H } else { 0.0 };
     let card_size = egui::vec2(cell_w, card_h);
 
     // Reserve space for the card and make the whole thing clickable
@@ -249,40 +255,40 @@ where
         egui::vec2(cell_w - INNER_MARGIN * 2.0, image_h),
     );
 
-    draw_thumbnail(ctx, ui, cache_key, thumb_bytes, image_rect, textures);
+    draw_thumbnail(
+        ctx,
+        ui,
+        cache_key,
+        thumb_bytes,
+        thumb_error,
+        image_rect,
+        textures,
+    );
 
-    // Label strip.
-    let label_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            card_rect.min.x + INNER_MARGIN,
-            image_rect.max.y + 1.0,
-        ),
-        egui::vec2(cell_w - INNER_MARGIN * 2.0, LABEL_H),
-    );
-    let label_color = if in_catalog {
-        visuals.weak_text_color()
-    } else {
-        visuals.text_color()
-    };
-    let label_text = if in_catalog {
-        "already imported".to_string()
-    } else {
-        config.label_override.clone().unwrap_or_else(|| {
-            // Default to the file name component of the full path.
-            std::path::Path::new(full_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string()
-        })
-    };
-    ui.painter().text(
-        label_rect.left_center(),
-        egui::Align2::LEFT_CENTER,
-        label_text,
-        egui::FontId::proportional(12.0),
-        label_color,
-    );
+    // Label strip (only rendered when there is text to show).
+    if show_label {
+        let label_rect = egui::Rect::from_min_size(
+            egui::pos2(card_rect.min.x + INNER_MARGIN, image_rect.max.y + 1.0),
+            egui::vec2(cell_w - INNER_MARGIN * 2.0, LABEL_H),
+        );
+        let label_color = if in_catalog {
+            visuals.weak_text_color()
+        } else {
+            visuals.text_color()
+        };
+        let label_text = if in_catalog {
+            "already imported".to_string()
+        } else {
+            config.label_override.clone().unwrap_or_default()
+        };
+        ui.painter().text(
+            label_rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            label_text,
+            egui::FontId::proportional(12.0),
+            label_color,
+        );
+    }
 
     card_response
 }
@@ -295,6 +301,7 @@ pub fn draw_thumbnail<K>(
     ui: &mut egui::Ui,
     cache_key: K,
     thumb_bytes: Option<&ThumbnailBytes>,
+    thumb_error: Option<&str>,
     image_rect: egui::Rect,
     textures: &Mutex<HashMap<K, egui::TextureHandle>>,
 ) where
@@ -326,6 +333,34 @@ pub fn draw_thumbnail<K>(
             );
             ui.painter().image(tex.id(), dest, uv, egui::Color32::WHITE);
         }
+    } else if let Some(err) = thumb_error {
+        // Last attempt errored: paint the letterbox background
+        // and a small error label centred in the cell. This gives
+        // the user feedback for permanently broken files (e.g.
+        // moved/deleted between import and library open) instead
+        // of an infinite spinner.
+        ui.painter().rect_filled(
+            image_rect,
+            egui::CornerRadius::same(2),
+            ui.style().visuals.widgets.noninteractive.bg_fill,
+        );
+        ui.painter().text(
+            image_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "err",
+            egui::FontId::proportional(20.0),
+            egui::Color32::LIGHT_RED,
+        );
+        let trimmed = err.chars().take(40).collect::<String>();
+        ui.painter().text(
+            egui::pos2(image_rect.center().x, image_rect.max.y - 4.0),
+            egui::Align2::CENTER_BOTTOM,
+            format!("{trimmed}..."),
+            egui::FontId::proportional(10.0),
+            ui.style().visuals.weak_text_color(),
+        );
+        // Also place the full error on hover.
+        // (Caller has already attached the full path on the card.)
     } else {
         // Still loading: paint an animated spinner directly in the
         // image rect. Using `Spinner::paint_at` (instead of
@@ -367,7 +402,7 @@ pub fn fit_inside(outer: egui::Rect, src_w: f32, src_h: f32) -> egui::Rect {
 /// stable cache key for each cell via the `key_for` closure in
 /// [`show_thumb_grid`] so a refresh that re-orders the list doesn't
 /// invalidate loaded textures.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GridItem {
     /// Stable id for this cell (e.g. `Photo::id`). The import dialog
     /// leaves this as `None` and hashes the path. The library
@@ -376,15 +411,21 @@ pub struct GridItem {
     /// Full file path. Used for hover and as the default label.
     pub full_path: String,
     /// Decoded thumbnail bytes, or `None` while the worker is
-    /// still loading.
+    /// still loading (or has failed; see `thumb_error`).
     pub thumb_bytes: Option<ThumbnailBytes>,
+    /// Human-readable error from the last thumbnail attempt. When
+    /// `thumb_bytes` is `None` *and* this is `Some`, the cell
+    /// shows the error text instead of a spinner so the user has
+    /// feedback for permanently broken files.
+    pub thumb_error: Option<String>,
     /// Visual / behavioural config for this cell.
     pub config: ThumbCardConfig,
 }
 
-/// Render a centred, row-by-row grid of items. Each row is a
-/// `ui.horizontal` block so the partial trailing row stays at the
-/// same horizontal offset as the full rows above it.
+/// Render a centred, row-by-row grid of items inside a scrollable
+/// area constrained to `max_height`. Each row is a `ui.horizontal`
+/// block so the partial trailing row stays at the same horizontal
+/// offset as the full rows above it.
 pub fn show_thumb_grid<K, F>(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
@@ -396,49 +437,67 @@ pub fn show_thumb_grid<K, F>(
     K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
     F: Fn(&GridItem) -> K,
 {
-    let layout = compute_grid(ui);
-    let n = items.len();
-
     let scroll = egui::ScrollArea::vertical()
         .max_height(max_height)
         .auto_shrink([false, false]);
     scroll.show(ui, |ui| {
-        for (row_idx, row_start) in (0..n).step_by(layout.cells_per_row).enumerate() {
-            let row_end = (row_start + layout.cells_per_row).min(n);
-            let in_row = row_end - row_start;
-            let row_w = in_row as f32 * layout.cell_pitch - COL_SPACING;
-            let available = ui.available_width();
-            // Use the wider of "what a full row needs" and "what
-            // this row actually has" so the centering math stays
-            // stable across the full/partial transition.
-            let reference_w = layout.full_row_w.max(row_w);
-            let pad = ((available - reference_w) * 0.5).max(0.0);
-
-            let resp = ui.horizontal(|ui| {
-                ui.add_space(pad);
-                ui.spacing_mut().item_spacing.x = COL_SPACING;
-                for item in items[row_start..row_end].iter_mut() {
-                    let bytes = item.thumb_bytes.as_ref();
-                    let path = item.full_path.clone();
-                    let cache_key = key_for(item);
-                    let _ = thumb_card(
-                        ctx,
-                        ui,
-                        cache_key,
-                        &mut item.config,
-                        bytes,
-                        &path,
-                        textures,
-                    );
-                }
-            });
-            let _ = resp;
-            // Spacing between rows.
-            if row_idx + 1 < n.div_ceil(layout.cells_per_row) {
-                ui.add_space(ROW_SPACING);
-            }
-        }
+        show_thumb_rows(ctx, ui, items, textures, key_for);
     });
+}
+
+/// Row-by-row thumbnail grid rendering without a scroll wrapper.
+/// Useful when the caller wants to embed the grid inside its own
+/// scroll area (e.g. to insert date dividers between groups).
+pub(crate) fn show_thumb_rows<K, F>(
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    items: &mut [GridItem],
+    textures: &Mutex<HashMap<K, egui::TextureHandle>>,
+    key_for: F,
+) where
+    K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
+    F: Fn(&GridItem) -> K,
+{
+    let layout = compute_grid(ui);
+    let n = items.len();
+
+    for (row_idx, row_start) in (0..n).step_by(layout.cells_per_row).enumerate() {
+        let row_end = (row_start + layout.cells_per_row).min(n);
+        let in_row = row_end - row_start;
+        let row_w = in_row as f32 * layout.cell_pitch - COL_SPACING;
+        let available = ui.available_width();
+        // Use the wider of "what a full row needs" and "what
+        // this row actually has" so the centering math stays
+        // stable across the full/partial transition.
+        let reference_w = layout.full_row_w.max(row_w);
+        let pad = ((available - reference_w) * 0.5).max(0.0);
+
+        let resp = ui.horizontal(|ui| {
+            ui.add_space(pad);
+            ui.spacing_mut().item_spacing.x = COL_SPACING;
+            for item in items[row_start..row_end].iter_mut() {
+                let bytes = item.thumb_bytes.as_ref();
+                let error = item.thumb_error.as_deref();
+                let path = item.full_path.clone();
+                let cache_key = key_for(item);
+                let _ = thumb_card(
+                    ctx,
+                    ui,
+                    cache_key,
+                    &mut item.config,
+                    bytes,
+                    error,
+                    &path,
+                    textures,
+                );
+            }
+        });
+        let _ = resp;
+        // Spacing between rows.
+        if row_idx + 1 < n.div_ceil(layout.cells_per_row) {
+            ui.add_space(ROW_SPACING);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -465,9 +524,16 @@ mod tests {
     }
 
     #[test]
-    fn card_height_matches_image_plus_label() {
-        let h = card_height(THUMB_CELL);
+    fn card_height_with_label() {
+        let h = card_height(THUMB_CELL, true);
         // 156 * (2/3) + 18 + 8 = 104 + 18 + 8 = 130
         assert!((h - 130.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn card_height_without_label() {
+        let h = card_height(THUMB_CELL, false);
+        // 156 * (2/3) + 8 = 104 + 8 = 112
+        assert!((h - 112.0).abs() < 0.5);
     }
 }

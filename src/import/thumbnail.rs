@@ -78,6 +78,9 @@ pub enum ThumbnailError {
 
     #[error("exif parse error: {0}")]
     Exif(String),
+
+    #[error("raw decode error: {0}")]
+    RawDecode(String),
 }
 
 /// Try every strategy to produce a thumbnail. Returns `Err` only if
@@ -95,7 +98,14 @@ pub fn extract_thumbnail(path: &Path) -> Result<Thumbnail, ThumbnailError> {
     }
 
     // Strategy 3: full-file decode for JPEGs and other supported types.
-    extract_full(path)
+    if let Ok(t) = extract_full(path) {
+        return Ok(t);
+    }
+
+    // Strategy 4: raw sensor decode via rawloader (handles X3F, ORF,
+    // MRW and many other camera raw formats that lack a readable
+    // embedded JPEG preview).
+    extract_raw_thumbnail(path)
 }
 
 /// Try every IFD's `JPEGInterchangeFormat` tag. The first one whose
@@ -103,7 +113,33 @@ pub fn extract_thumbnail(path: &Path) -> Result<Thumbnail, ThumbnailError> {
 /// data to the `image` crate's format guesser -- that's how we ended
 /// up feeding a tiny CR2 CFA thumbnail to the TIFF decoder and
 /// getting "unknown photometric interpretation" errors.
-fn extract_embedded(path: &Path) -> Result<Thumbnail, ThumbnailError> {
+/// Extract a preview for the import dialog: embedded JPEG only,
+/// never a full raw-file decode. Falls through to `scan_for_largest_jpeg`
+/// (no raw processing) and, for standard image files (JPEG/PNG/TIFF),
+/// a fast full-file decode. Returns an error for raw files without
+/// an embedded JPEG preview.
+pub fn extract_dialog_preview(path: &Path) -> Result<Thumbnail, ThumbnailError> {
+    if let Ok(t) = extract_embedded(path) {
+        return Ok(t);
+    }
+    if let Ok(t) = scan_for_largest_jpeg(path) {
+        return Ok(t);
+    }
+    if (is_jpeg(path) || is_png(path) || is_tiff(path))
+        && let Ok(t) = extract_full(path)
+    {
+        return Ok(t);
+    }
+    // Last resort: raw sensor decode via rawloader.
+    extract_raw_thumbnail(path)
+}
+
+/// Try every IFD's `JPEGInterchangeFormat` tag. The first one whose
+/// referenced bytes start with JPEG magic wins. We never hand raw
+/// data to the `image` crate's format guesser -- that's how we ended
+/// up feeding a tiny CR2 CFA thumbnail to the TIFF decoder and
+/// getting "unknown photometric interpretation" errors.
+pub fn extract_embedded(path: &Path) -> Result<Thumbnail, ThumbnailError> {
     let mut file = std::fs::File::open(path)?;
     let exif = {
         let mut reader = std::io::BufReader::new(&file);
@@ -171,7 +207,7 @@ fn extract_embedded(path: &Path) -> Result<Thumbnail, ThumbnailError> {
 /// expose the preview via `JPEGInterchangeFormat` (or for CR2 where the
 /// tagged preview is a tiny raw CFA thumbnail that the `image` crate
 /// can't read).
-fn scan_for_largest_jpeg(path: &Path) -> Result<Thumbnail, ThumbnailError> {
+pub fn scan_for_largest_jpeg(path: &Path) -> Result<Thumbnail, ThumbnailError> {
     let mut file = std::fs::File::open(path)?;
     let total = file.metadata()?.len();
     let to_scan = total.min(SCAN_LIMIT);
@@ -306,6 +342,53 @@ fn extract_full(path: &Path) -> Result<Thumbnail, ThumbnailError> {
     })
 }
 
+/// Decode a camera raw file (X3F, ORF, MRW, …) via rawler and
+/// produce a grayscale thumbnail from the raw sensor data.
+/// This is used as a last-resort fallback when no embedded JPEG
+/// preview is found and the image crate can't decode the format.
+fn extract_raw_thumbnail(path: &Path) -> Result<Thumbnail, ThumbnailError> {
+    let img = rawler::decode_file(path).map_err(|e| ThumbnailError::RawDecode(e.to_string()))?;
+
+    let (sw, sh) = (img.width, img.height);
+    if sw == 0 || sh == 0 {
+        return Err(ThumbnailError::RawDecode("empty raw image".into()));
+    }
+
+    let data = match &img.data {
+        rawler::RawImageData::Integer(d) => d,
+        _ => return Err(ThumbnailError::RawDecode("floating-point raw data not supported".into())),
+    };
+
+    // Nearest-neighbour downscale straight from the raw sensor
+    // samples.  At thumbnail scale the result is perfectly
+    // recognisable even without demosaicing.
+    let scale = (THUMB_MAX_DIM as f32 / sw.max(sh) as f32).min(1.0);
+    let dw = (sw as f32 * scale).ceil() as u32;
+    let dh = (sh as f32 * scale).ceil() as u32;
+    let mut rgba = vec![0u8; (dw * dh * 4) as usize];
+
+    for dy in 0..dh {
+        let sy = ((dy as f32) / scale) as usize;
+        for dx in 0..dw {
+            let sx = ((dx as f32) / scale) as usize;
+            let src_idx = sy * sw + sx;
+            let val = data.get(src_idx).map(|v| (v >> 8) as u8).unwrap_or(0);
+            let dst_idx = (dy * dw + dx) as usize * 4;
+            rgba[dst_idx] = val;
+            rgba[dst_idx + 1] = val;
+            rgba[dst_idx + 2] = val;
+            rgba[dst_idx + 3] = 255;
+        }
+    }
+
+    Ok(Thumbnail {
+        width: dw,
+        height: dh,
+        rgba,
+        max_dim: THUMB_MAX_DIM,
+    })
+}
+
 /// True if the file's extension looks like JPEG. We use the
 /// extension rather than reading magic bytes because `extract_full`
 /// is only called for files that already failed the embedded-JPEG
@@ -318,6 +401,26 @@ fn is_jpeg(path: &Path) -> bool {
             .map(|s| s.to_ascii_lowercase())
             .as_deref(),
         Some("jpg" | "jpeg" | "jpe")
+    )
+}
+
+fn is_png(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("png")
+    )
+}
+
+fn is_tiff(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("tif" | "tiff")
     )
 }
 

@@ -45,6 +45,9 @@ pub struct Photo {
     pub file_format: Option<String>,
     pub file_extension: Option<String>,
     pub error: Option<String>,
+
+    // V003
+    pub thumbnail_status: i64,
 }
 
 impl Photo {
@@ -78,6 +81,7 @@ impl Photo {
             file_format: row.get("file_format")?,
             file_extension: row.get("file_extension")?,
             error: row.get("error")?,
+            thumbnail_status: row.get("thumbnail_status")?,
         })
     }
 }
@@ -173,15 +177,15 @@ impl Catalog {
     }
 
     /// List photos in the catalog. `limit` caps the number of rows
-    /// returned (use `None` for everything). The order is the
-    /// lightroom-style "imported last first" sort: `imported_at`
-    /// descending, then `id` descending as a stable tiebreaker.
+    /// returned (use `None` for everything). Sorted by capture date
+    /// (falling back to import date so newly-imported photos without
+    /// EXIF dates appear near the top), then id as a stable tiebreak.
     pub fn list_photos(&self, limit: Option<i64>) -> Result<Vec<Photo>> {
         let conn = self.pool.get()?;
         let sql = if let Some(lim) = limit {
-            format!("SELECT * FROM photos ORDER BY imported_at DESC, id DESC LIMIT {lim}")
+            format!("SELECT * FROM photos ORDER BY COALESCE(date_taken, imported_at) DESC, id DESC LIMIT {lim}")
         } else {
-            "SELECT * FROM photos ORDER BY imported_at DESC, id DESC".to_string()
+            "SELECT * FROM photos ORDER BY COALESCE(date_taken, imported_at) DESC, id DESC".to_string()
         };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], Photo::from_row)?;

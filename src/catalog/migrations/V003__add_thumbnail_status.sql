@@ -1,0 +1,1 @@
+ALTER TABLE photos ADD COLUMN thumbnail_status INTEGER NOT NULL DEFAULT 0;

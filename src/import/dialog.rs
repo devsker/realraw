@@ -44,7 +44,7 @@ use eframe::egui;
 
 use crate::catalog::Catalog;
 use crate::import::discovery::{DiscoveredFile, KNOWN_EXTENSIONS};
-use crate::import::thumbnail::{extract_thumbnail, Thumbnail};
+use crate::import::thumbnail::{extract_dialog_preview, Thumbnail};
 use crate::import::worker::{import_batch, ImportFile, ImportSummary};
 /// Maximum number of outstanding thumbnail requests.
 const MAX_INFLIGHT_THUMBS: usize = 48;
@@ -101,7 +101,7 @@ pub struct ImportDialog {
 
     import_summary: Option<ImportSummary>,
     import_in_flight: bool,
-    import_summary_rx: Option<Receiver<ImportSummary>>,
+    pub(crate) import_summary_rx: Option<Receiver<ImportSummary>>,
 
     /// Per-dialog texture cache. Keyed by file index. Dropped when the
     /// dialog closes.
@@ -133,7 +133,7 @@ impl Default for ImportDialog {
             files: Vec::new(),
             extensions: KNOWN_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
             sources: Vec::new(),
-            status: "Pick a folder or files to import.".to_string(),
+            status: String::new(),
             discovery_cancel: Arc::new(AtomicBool::new(false)),
             discovery_rx: None,
             thumb_tx,
@@ -246,7 +246,24 @@ impl ImportDialog {
                         self.textures.lock().unwrap().remove(&key);
                     }
                     Err(e) => {
+                        eprintln!(
+                            "thumb failed for {}: {e}",
+                            r.path.display(),
+                        );
                         f.thumb_error = Some(e);
+                        // Critical: clear `thumb_requested` and
+                        // `thumb_ready` so the next
+                        // `request_visible_thumbs` pass picks this
+                        // file up again. Without this, a failed
+                        // extraction would pin the cell at the
+                        // spinner forever (matching the library's
+                        // bug, just in different shape).
+                        f.thumb_requested = false;
+                        f.thumb_ready = false;
+                        // Don't set `thumb_ready = true` here -- the
+                        // cell will stay in the "loading" state and
+                        // get retried.
+                        continue;
                     }
                 }
                 f.thumb_ready = true;
@@ -279,20 +296,35 @@ impl ImportDialog {
             // Mark first to avoid double-spawn in the same frame.
             if let Some(f) = self.files.get_mut(i) {
                 f.thumb_requested = true;
+                // Clear any prior error so the cell goes back to
+                // showing the spinner while we wait for the retry.
+                f.thumb_error = None;
             }
             self.inflight_thumbs += 1;
             let tx = self.thumb_tx.clone();
-            thread::Builder::new()
+            let result = thread::Builder::new()
                 .name(format!("thumb-{i}"))
                 .spawn(move || {
-                    let result = extract_thumbnail(&path).map_err(|e| e.to_string());
+                    let result = match std::panic::catch_unwind(|| {
+                        extract_dialog_preview(&path).map_err(|e| e.to_string())
+                    }) {
+                        Ok(r) => r,
+                        Err(_) => Err("thumbnail worker panicked".to_string()),
+                    };
                     let _ = tx.send(ThumbResult {
                         index: i,
                         path,
                         result,
                     });
-                })
-                .expect("spawn thumb worker");
+                });
+            if result.is_err() {
+                // Spawn failed — reset state so the cell can try
+                // again on the next frame.
+                self.inflight_thumbs -= 1;
+                if let Some(f) = self.files.get_mut(i) {
+                    f.thumb_requested = false;
+                }
+            }
         }
     }
 
@@ -303,7 +335,7 @@ impl ImportDialog {
         catalog: Option<Arc<Catalog>>,
         task_manager: &mut crate::task::TaskManager,
     ) -> bool {
-        self.pump_events();
+                self.pump_events();
 
         let mut should_close = false;
 
@@ -311,29 +343,11 @@ impl ImportDialog {
             .show(ctx, |ui| {
                 ui.heading("Import Photos");
                 ui.horizontal(|ui| {
-                    if ui.button("Add folder...").clicked()
-                        && let Some(p) = rfd::FileDialog::new().pick_folder()
-                    {
-                        self.sources = vec![p];
-                        self.begin_discovery(self.sources.clone(), catalog.clone());
-                    }
-                    if ui.button("Add files...").clicked() {
-                        let exts: Vec<&str> = KNOWN_EXTENSIONS
-                            .iter()
-                            .map(|s| s.trim_start_matches('.'))
-                            .collect();
-                        if let Some(paths) = rfd::FileDialog::new()
-                            .add_filter("Images", &exts)
-                            .pick_files()
-                        {
-                            self.sources = paths;
-                            self.begin_discovery(self.sources.clone(), catalog.clone());
-                        }
-                    }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            if ui.button("x").on_hover_text("Close").clicked() {
+                            let close_icon = egui_phosphor::variants::regular::X;
+                            if ui.button(close_icon.to_string()).on_hover_text("Close").clicked() {
                                 should_close = true;
                             }
                         },
@@ -343,7 +357,32 @@ impl ImportDialog {
 
                 match self.phase {
                     Phase::Empty => {
-                        ui.label(&self.status);
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(20.0);
+                            let icon_f = egui_phosphor::variants::regular::FOLDER;
+                            if ui.button(format!("{icon_f}  Select Folder")).clicked()
+                                && let Some(p) = rfd::FileDialog::new().pick_folder()
+                            {
+                                self.sources = vec![p];
+                                self.begin_discovery(self.sources.clone(), catalog.clone());
+                            }
+                            ui.add_space(8.0);
+                            let icon_file = egui_phosphor::variants::regular::FILE;
+                            if ui.button(format!("{icon_file}  Select Files")).clicked()
+                            {
+                                let exts: Vec<&str> = KNOWN_EXTENSIONS
+                                    .iter()
+                                    .map(|s| s.trim_start_matches('.'))
+                                    .collect();
+                                if let Some(paths) = rfd::FileDialog::new()
+                                    .add_filter("Images", &exts)
+                                    .pick_files()
+                                {
+                                    self.sources = paths;
+                                    self.begin_discovery(self.sources.clone(), catalog.clone());
+                                }
+                            }
+                        });
                     }
                     Phase::Discovering => {
                         ui.horizontal(|ui| {
@@ -360,7 +399,7 @@ impl ImportDialog {
                         {
                             self.import_in_flight = false;
                             self.import_summary = Some(summary);
-                            self.phase = Phase::Done;
+                            should_close = true;
                         }
                         self.show_grid(ctx, ui);
                     }
@@ -374,7 +413,7 @@ impl ImportDialog {
                         {
                             self.import_in_flight = false;
                             self.import_summary = Some(summary);
-                            self.phase = Phase::Done;
+                            should_close = true;
                         }
                     }
                     Phase::Done => {
@@ -417,9 +456,6 @@ impl ImportDialog {
                                             selected: f.selected,
                                         })
                                         .collect();
-                                    self.phase = Phase::Importing;
-                                    self.status = "Importing...".to_string();
-                                    self.import_in_flight = true;
                                     self.import_summary_rx = Some(import_batch(
                                         task_manager,
                                         cat,
@@ -427,6 +463,7 @@ impl ImportDialog {
                                         "Import",
                                         None,
                                     ));
+                                    should_close = true;
                                 }
                                 if ui.button("Select All").clicked() {
                                     for f in &mut self.files {
@@ -477,6 +514,7 @@ impl ImportDialog {
                 id: None,
                 full_path: f.path.to_string_lossy().into_owned(),
                 thumb_bytes: f.thumb_bytes.clone(),
+                thumb_error: f.thumb_error.clone(),
                 config: crate::thumb_grid::ThumbCardConfig {
                     cell_w: layout.cell_w,
                     selectable: !f.already_in_catalog,
@@ -674,5 +712,58 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(found.len(), 2, "got {found:?}");
+    }
+
+    /// An errored thumbnail must clear `thumb_requested` and
+    /// `thumb_ready` so the cell gets retried on the next
+    /// `request_visible_thumbs` pass. Otherwise the cell sits at
+    /// the spinner forever, mirroring the library bug.
+    #[test]
+    fn errored_thumb_can_be_retried() {
+        let mut d = ImportDialog::default();
+        d.phase = Phase::Browsing;
+        d.files = vec![DialogFile {
+            path: std::path::PathBuf::from("/no/such/file.jpg"),
+            selected: true,
+            already_in_catalog: false,
+            thumb_bytes: None,
+            thumb_requested: true,
+            thumb_ready: false,
+            thumb_error: None,
+        }];
+        // Simulate a worker that errored: re-feed the channel with
+        // an Err result for the file. `pump_events` should reset
+        // `thumb_requested` and `thumb_ready` to `false` and store
+        // the error message.
+        d.thumb_tx
+            .send(ThumbResult {
+                index: 0,
+                path: d.files[0].path.clone(),
+                result: Err("boom".to_string()),
+            })
+            .unwrap();
+        d.pump_events();
+        assert!(d.files[0].thumb_error.is_some());
+        assert!(!d.files[0].thumb_requested);
+        assert!(!d.files[0].thumb_ready);
+
+        // Now `request_visible_thumbs` should re-queue the file and
+        // clear the error. The new worker would fail again (the
+        // path doesn't exist), but the *state* must be re-queueable
+        // -- the actual error is a separate concern.
+        d.request_visible_thumbs(0, d.files.len(), 4);
+        assert!(
+            d.files[0].thumb_requested,
+            "errored file should be re-queued"
+        );
+        assert!(
+            d.files[0].thumb_error.is_none(),
+            "error should be cleared on retry"
+        );
+        // Avoid actually spawning a worker for the bad path in the
+        // test cleanup; the test harness would have tried to
+        // extract_thumbnail on /no/such/file.jpg and recorded
+        // another error.
+        d.files[0].thumb_requested = false;
     }
 }

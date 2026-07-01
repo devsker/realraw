@@ -7,7 +7,7 @@ use eframe::egui;
 
 use crate::app::library::LibraryPage;
 use crate::catalog::{Catalog, Counts};
-use crate::import::{ImportDialog, dialog::Phase as DialogPhase};
+use crate::import::{ImportDialog, ImportSummary, dialog::Phase as DialogPhase};
 use crate::task::{TaskCommand, TaskManager, TaskSnapshot, TaskStatus, TaskViewOptions};
 
 /// Top-level application state. Owned by eframe's run loop and rendered once
@@ -48,6 +48,10 @@ pub struct App {
     /// `library_needs_refresh` *once*, on the transition, rather
     /// than every frame while the dialog stays in Done.
     pub last_dialog_phase: Option<DialogPhase>,
+    /// Receiver for the import batch summary. Held after the dialog
+    /// closes so we can defer the library refresh until the background
+    /// import tasks actually finish writing to the catalog.
+    import_summary_rx: Option<std::sync::mpsc::Receiver<ImportSummary>>,
 }
 
 impl Default for App {
@@ -85,6 +89,7 @@ impl Default for App {
             library_last_refresh_mtime_ms,
             library_needs_refresh: false,
             last_dialog_phase: None,
+            import_summary_rx: None,
         }
     }
 }
@@ -142,29 +147,28 @@ impl eframe::App for App {
         }
         if let Some(dialog) = self.import_dialog.as_mut() {
             let catalog = self.catalog.clone();
-            let phase_now = dialog.phase;
             let should_close = dialog.show(ctx, catalog, &mut self.task_manager);
             if should_close {
+                // Take the summary receiver before dropping the dialog.
+                // The import runs in the background; we defer the
+                // library refresh until the summary arrives.
+                self.import_summary_rx = dialog.import_summary_rx.take();
                 self.import_dialog = None;
+                // If no import was started (user just closed the dialog),
+                // refresh immediately.
+                if self.import_summary_rx.is_none() {
+                    self.library_needs_refresh = true;
+                }
             }
-            // Mark the library for refresh on the *transition* into
-            // Done -- not on every frame the dialog stays in Done.
-            // A previous version of this code matched on `phase_now`
-            // and so set the flag every frame, which made
-            // `render_central` call `library.refresh()` every
-            // frame. That wiped the texture cache + reset every
-            // thumb slot to None, so the library never got a chance
-            // to load anything (hence the "over half are at '...'"
-            // bug). The mtime fallback in `render_central` catches
-            // any post-close refresh anyway.
-            if !matches!(self.last_dialog_phase, Some(DialogPhase::Done))
-                && matches!(phase_now, DialogPhase::Done)
-            {
-                self.library_needs_refresh = true;
-            }
-            self.last_dialog_phase = Some(phase_now);
         } else {
             self.last_dialog_phase = None;
+        }
+        // Check if a background import finished since the last frame.
+        if let Some(rx) = &self.import_summary_rx
+            && let Ok(_) = rx.try_recv()
+        {
+            self.import_summary_rx = None;
+            self.library_needs_refresh = true;
         }
 
         // Keep repainting while tasks are running (smooth bar) and during
@@ -314,7 +318,10 @@ fn render_central(app: &mut App, ctx: &egui::Context) {
                 app.library.refresh(cat, None);
             }
         }
-        let _ = app.library.show(ctx, ui);
+        if let Some(cat) = &app.catalog {
+            app.library.importing = app.import_summary_rx.is_some();
+            let _ = app.library.show(ctx, ui, cat);
+        }
     });
 }
 
@@ -363,10 +370,7 @@ fn render_status_bar(app: &mut App, ctx: &egui::Context) {
                 ui.label(&path);
                 if let Some(c) = app.catalog_counts {
                     ui.separator();
-                    ui.label(format!(
-                        "photos: {}   collections: {}   folders: {}",
-                        c.photos, c.collections, c.folders
-                    ));
+                    ui.label(format!("photos: {}", c.photos));
                 }
             } else if let Some(err) = &app.catalog_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, err);

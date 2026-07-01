@@ -9,6 +9,7 @@ use refinery::embed_migrations;
 mod error;
 pub mod folder;
 pub mod photo;
+pub mod thumbnail_cache;
 
 pub use error::{CatalogError, Result};
 pub use folder::Folder;
@@ -116,6 +117,11 @@ impl Catalog {
         &self.path
     }
 
+    /// Parent directory containing this catalog (e.g. `~/Pictures/realraw/`).
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(self.path.as_ref())
+    }
+
     /// User-friendly path for the status bar: hides the `catalog.sqlite`
     /// filename and replaces the home directory with `~`.
     pub fn display_path(&self) -> String {
@@ -210,6 +216,25 @@ mod tests {
                 "missing table {expected}; got {tables:?}"
             );
         }
+    }
+
+    #[test]
+    fn v003_migration_adds_thumbnail_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sqlite");
+        let cat = Catalog::create(&path).unwrap();
+        let conn = cat.pool().get().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(photos)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            cols.contains(&"thumbnail_status".to_string()),
+            "V003 should add thumbnail_status; got {cols:?}"
+        );
     }
 
     #[test]
