@@ -7,27 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Allows appimagetool to run on systems without FUSE
   APPIMAGE_EXTRACT_AND_RUN: 1
 
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run tests
-        run: cargo test --release
-
-  package:
-    needs: test
+  ci:
     strategy:
       matrix:
         include:
@@ -60,15 +43,21 @@ jobs:
           cargo install cargo-deb
           cargo install cargo-appimage
 
-      - name: Build and package (macOS)
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Package (macOS)
         if: runner.os == 'macOS'
         run: ./scripts/package.sh all
 
-      - name: Build and package (Linux)
+      - name: Package (Linux)
         if: runner.os == 'Linux'
         run: ./scripts/package.sh all
 
-      - name: Build and package (Windows)
+      - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: ./scripts/package.sh all
