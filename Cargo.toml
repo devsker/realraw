@@ -2,6 +2,18 @@
 name = "realraw"
 version = "0.1.0"
 edition = "2024"
+description = "An open source Lightroom alternative"
+authors = ["marcelsker"]
+repository = "https://codeberg.org/sker/realraw"
+license = "AGPL-3.0-or-later"
+default-run = "realraw"
+
+[package.metadata.bundle]
+name = "realraw"
+identifier = "com.sker.realraw"
+icon = ["assets/icon.icns", "assets/icon.ico"]
+category = "Photography"
+copyright = "AGPL-3.0-or-later"
 
 [lib]
 name = "realraw"
@@ -29,6 +41,9 @@ jpeg-decoder = "0.3"
 hex = "0.4"
 rawler = "0.7"
 egui-phosphor = "0.9"
+
+[build-dependencies]
+embed-resource = "3"
 
 [dev-dependencies]
 tempfile = "3"
