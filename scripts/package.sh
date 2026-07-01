@@ -14,7 +14,7 @@ Commands:
   app-macos        Build .app bundle for macOS (requires cargo-bundle)
   dmg              Build .app then wrap in .dmg (requires create-dmg)
   deb              Build .deb package for Debian/Ubuntu (requires cargo-deb)
-  appimage         Build AppImage for Linux (requires cargo-appimage)
+  appimage         Build AppImage for Linux
   exe              Build Windows .exe (icon embedded automatically via build.rs)
   all              Run all available commands for the current OS
   help             Show this help
@@ -63,10 +63,47 @@ cmd_deb() {
 }
 
 cmd_appimage() {
-    require_cmd cargo-appimage
     echo "==> Building AppImage..."
-    cargo appimage
-    echo "==> Done: target/release/${BIN_NAME}*.AppImage"
+
+    local appdir="target/AppDir"
+    local binary="target/release/$BIN_NAME"
+    local appimagetool="/tmp/appimagetool"
+
+    # Build binary if not already present
+    if [ ! -f "$binary" ]; then
+        cargo build --release
+    fi
+
+    # Create AppDir structure
+    rm -rf "$appdir"
+    mkdir -p "$appdir/usr/bin"
+    mkdir -p "$appdir/usr/share/applications"
+    mkdir -p "$appdir/usr/share/icons/hicolor/64x64/apps"
+
+    cp "$binary" "$appdir/usr/bin/"
+    cp assets/realraw.desktop "$appdir/usr/share/applications/"
+    cp assets/icon-64.png "$appdir/usr/share/icons/hicolor/64x64/apps/realraw.png"
+
+    # AppImage discovery: AppRun + top-level symlinks
+    cat > "$appdir/AppRun" <<'APPRUN'
+#!/bin/bash
+exec "$(dirname "$0")/usr/bin/realraw"
+APPRUN
+    chmod +x "$appdir/AppRun"
+    ln -s "usr/share/applications/$BIN_NAME.desktop" "$appdir/$BIN_NAME.desktop" 2>/dev/null || true
+    ln -s "usr/share/icons/hicolor/64x64/apps/realraw.png" "$appdir/.DirIcon" 2>/dev/null || true
+
+    # Download appimagetool if not cached
+    if [ ! -f "$appimagetool" ]; then
+        echo "Downloading appimagetool..."
+        wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -O "$appimagetool"
+        chmod +x "$appimagetool"
+    fi
+
+    # Build the AppImage
+    ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$appimagetool" "$appdir" "target/release/${BIN_NAME}-x86_64.AppImage"
+
+    echo "==> Done: target/release/${BIN_NAME}-x86_64.AppImage"
 }
 
 cmd_exe() {
