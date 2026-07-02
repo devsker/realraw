@@ -215,6 +215,25 @@ where
         config.selected = !config.selected;
     }
 
+    // Right-click context menu.
+    // Reveal uses a helper that selects the file in the system file
+    // manager — the `open` crate only opens the parent folder without
+    // selection, so we use platform-specific commands instead.
+    response.context_menu(|ui| {
+        if ui.button("Open").clicked() {
+            eprintln!("context menu: Open (not implemented)");
+            ui.close_menu();
+        }
+        if ui.button("Remove").clicked() {
+            eprintln!("context menu: Remove (not implemented)");
+            ui.close_menu();
+        }
+        if ui.button("Reveal").clicked() {
+            reveal_in_file_manager(full_path);
+            ui.close_menu();
+        }
+    });
+
     let card_response = CardResponse {
         clicked: response.clicked(),
         hovered: response.hovered(),
@@ -496,6 +515,71 @@ pub(crate) fn show_thumb_rows<K, F>(
         // Spacing between rows.
         if row_idx + 1 < n.div_ceil(layout.cells_per_row) {
             ui.add_space(ROW_SPACING);
+        }
+    }
+}
+
+/// Open the system's file manager at the folder containing `path` and
+/// **select** the file itself, so the user sees it highlighted.
+///
+/// The `open` crate would open the file with its default application or
+/// open the parent folder — it does not support "reveal with selection"
+/// — so we use platform-specific commands directly.
+fn reveal_in_file_manager(path: &str) {
+    let path = std::path::Path::new(path);
+
+    #[cfg(target_os = "macos")]
+    {
+        // `open -R` reveals and selects the file in Finder.
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // `/select,` opens Explorer with the file highlighted.
+        let _ = std::process::Command::new("explorer")
+            .arg(format!("/select,\"{}\"", path.display()))
+            .spawn();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try the freedesktop FileManager1 D-Bus interface first
+        // (works in GNOME/Nautilus, KDE/Dolphin). If that fails,
+        // fall back to `xdg-open` on the parent directory. We
+        // still prefer the D-Bus approach because xdg-open on a
+        // folder just opens it without selecting the file.
+        let file_uri = format!(
+            "file://{}",
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .display()
+        );
+        let dbus = std::process::Command::new("dbus-send")
+            .args([
+                "--session",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("array:string:{file_uri}"),
+                "string:\"\"",
+            ])
+            .spawn();
+        if dbus.is_err() {
+            if let Some(parent) = path.parent().and_then(|p| p.to_str()) {
+                let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        if let Some(parent) = path.parent().and_then(|p| p.to_str()) {
+            let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
         }
     }
 }
