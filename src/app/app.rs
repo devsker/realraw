@@ -19,39 +19,53 @@ type StartupResult = Option<(PathBuf, Catalog)>;
 pub struct App {
     /// Show the "About" modal.
     pub show_about: bool,
-    /// Background task manager -- owns every running / queued task.
+
+    /// Background task manager - owns every running / queued task.
     pub task_manager: TaskManager,
+
     /// Snapshot of the manager taken on the last frame; rendered this frame.
     pub last_snapshot: TaskSnapshot,
+    
     /// Counter used to label successive demo batches.
     pub next_demo_id: u32,
+    
     /// Whether the bottom dropdown panel is currently open.
     pub tasks_open: bool,
+    
     /// When the most recent batch of tasks finished. Drives the
     /// "stay visible for 1s after done" grace period on the badge.
     pub all_done_at: Option<Instant>,
+    
     /// Currently open catalog, or `None` if open failed.
     pub catalog: Option<Arc<Catalog>>,
+    
     /// Last known row counts, refreshed each frame.
     pub catalog_counts: Option<Counts>,
+    
     /// Last error from the catalog layer, surfaced in the status bar.
     pub catalog_error: Option<String>,
+    
     /// The in-window import dialog, when open. Drop to close.
     pub import_dialog: Option<ImportDialog>,
+    
     /// The library page: thumbnail grid of every photo in the catalog.
     pub library: LibraryPage,
+    
     /// mtime (unix milliseconds) of the catalog file the last time
     /// we refreshed the library. `None` means "not yet refreshed".
     pub library_last_refresh_mtime_ms: Option<i64>,
+    
     /// Set by the import dialog when an import batch finishes; the
     /// library checks this every frame and refreshes immediately
     /// instead of waiting for the mtime to drift forward.
     pub library_needs_refresh: bool,
+    
     /// Last-seen phase of the import dialog. Used to detect the
     /// transition into [`DialogPhase::Done`] so we set
     /// `library_needs_refresh` *once*, on the transition, rather
     /// than every frame while the dialog stays in Done.
     pub last_dialog_phase: Option<DialogPhase>,
+    
     /// Receiver for the import batch summary. Held after the dialog
     /// closes so we can defer the library refresh until the background
     /// import tasks actually finish writing to the catalog.
@@ -62,10 +76,13 @@ pub struct App {
 
     /// Whether to show the first-launch setup dialog.
     pub show_setup_dialog: bool,
+    
     /// Collection name entered in the setup dialog.
     pub setup_name: String,
+    
     /// Directory chosen in the setup dialog.
     pub setup_dir: PathBuf,
+    
     /// Last error from catalog creation in the setup dialog.
     pub setup_error: Option<String>,
 
