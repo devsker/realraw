@@ -2,6 +2,7 @@
 
 #[allow(clippy::module_inception)]
 mod app;
+pub mod close_dialog;
 pub mod about_dialog;
 pub mod central;
 pub mod library;

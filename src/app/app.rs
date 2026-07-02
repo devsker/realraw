@@ -76,6 +76,13 @@ pub struct App {
 
     /// Whether to show the first-launch setup dialog.
     pub show_setup_dialog: bool,
+
+    /// Whether the "Quit realraw?" confirmation modal is open.
+    pub show_close_dialog: bool,
+
+    /// True after the user confirmed quit; suppresses the dialog logic so the
+    /// pending `ViewportCommand::Close` is not cancelled by a follow-up frame.
+    pub closing: bool,
     
     /// Collection name entered in the setup dialog.
     pub setup_name: String,
@@ -128,6 +135,8 @@ impl Default for App {
             import_summary_rx: None,
             logo: None,
             show_setup_dialog: false,
+            show_close_dialog: false,
+            closing: false,
             setup_name: String::new(),
             setup_dir: PathBuf::new(),
             setup_error: None,
@@ -249,6 +258,18 @@ impl eframe::App for App {
         {
             self.import_summary_rx = None;
             self.library_needs_refresh = true;
+        }
+
+        if !self.closing {
+            let close_requested = ctx.input(|i| i.viewport().close_requested());
+
+            if close_requested && !self.show_close_dialog {
+                self.show_close_dialog = true;
+            }
+
+            if self.show_close_dialog {
+                crate::app::close_dialog::render(self, ctx);
+            }
         }
 
         // Keep repainting while tasks are running (smooth bar) and during
