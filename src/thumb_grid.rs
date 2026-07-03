@@ -90,7 +90,7 @@ impl Default for ThumbCardConfig {
 
 /// Outcome of drawing a card, returned to the caller so it can update
 /// its own state (e.g. toggle a `selected` flag in the photo row).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct CardResponse {
     /// `true` if the user just clicked the card. The caller should
     /// toggle the corresponding `selected` flag in its own state.
@@ -100,6 +100,20 @@ pub struct CardResponse {
     /// `true` if the user clicked "Remove" in the card's context
     /// menu. The caller should handle the removal flow.
     pub remove_requested: bool,
+    /// Screen-space rectangle of the card, in the caller's coordinate
+    /// space. Useful for hit-testing (rubber-band selection, etc.).
+    pub rect: egui::Rect,
+}
+
+impl Default for CardResponse {
+    fn default() -> Self {
+        Self {
+            clicked: false,
+            hovered: false,
+            remove_requested: false,
+            rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO),
+        }
+    }
 }
 
 /// Grid metrics computed from the available width.
@@ -240,9 +254,10 @@ where
     });
 
     let card_response = CardResponse {
-        clicked: response.clicked(),
+        clicked: response.clicked() && config.selectable && !config.in_catalog,
         hovered: response.hovered(),
         remove_requested: remove_clicked.get(),
+        rect: card_rect,
     };
 
     let selected = config.selected && !config.in_catalog;
@@ -427,7 +442,7 @@ pub fn fit_inside(outer: egui::Rect, src_w: f32, src_h: f32) -> egui::Rect {
 /// stable cache key for each cell via the `key_for` closure in
 /// [`show_thumb_grid`] so a refresh that re-orders the list doesn't
 /// invalidate loaded textures.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GridItem {
     /// Stable id for this cell (e.g. `Photo::id`). The import dialog
     /// leaves this as `None` and hashes the path. The library
@@ -445,6 +460,22 @@ pub struct GridItem {
     pub thumb_error: Option<String>,
     /// Visual / behavioural config for this cell.
     pub config: ThumbCardConfig,
+    /// Screen-space rectangle of the card, updated by the renderer
+    /// each frame. Useful for hit-testing (rubber-band selection).
+    pub rect: egui::Rect,
+}
+
+impl Default for GridItem {
+    fn default() -> Self {
+        Self {
+            id: None,
+            full_path: String::new(),
+            thumb_bytes: None,
+            thumb_error: None,
+            config: ThumbCardConfig::default(),
+            rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO),
+        }
+    }
 }
 
 /// Render a centred, row-by-row grid of items inside a scrollable
@@ -528,6 +559,7 @@ where
                     textures,
                     item.id,
                 );
+                item.rect = resp.rect;
                 if resp.remove_requested && let Some(id) = item.id {
                     remove_ids.push(id);
                 }

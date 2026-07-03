@@ -522,6 +522,7 @@ impl ImportDialog {
                     in_catalog: f.already_in_catalog,
                     label_override: None,
                 },
+                rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO),
             })
             .collect();
 

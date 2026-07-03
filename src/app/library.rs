@@ -142,6 +142,17 @@ pub struct LibraryPage {
 
     /// Last load error (e.g. catalog query failure), if any.
     last_error: Option<String>,
+
+    /// Set of currently selected photo ids.
+    selected_ids: std::collections::HashSet<i64>,
+
+    /// Origin of the rubber-band selection rect (in scroll-content
+    /// coordinates), or `None` while not dragging.
+    rubber_band_origin: Option<egui::Pos2>,
+    /// Current pointer position during a rubber-band drag.
+    rubber_band_current: Option<egui::Pos2>,
+    /// Whether a rubber-band drag is currently active.
+    rubber_band_active: bool,
 }
 
 /// Per-photo thumbnail state held in the library's `HashMap`.
@@ -181,6 +192,10 @@ impl Default for LibraryPage {
             inflight_thumbs: AtomicUsize::new(0),
             last_error: None,
             remove_dialog: RemoveDialog::default(),
+            selected_ids: std::collections::HashSet::new(),
+            rubber_band_origin: None,
+            rubber_band_current: None,
+            rubber_band_active: false,
         }
     }
 }
@@ -311,10 +326,12 @@ impl LibraryPage {
         let groups = group_by_date(&self.photos);
 
         let mut remove_ids = Vec::new();
+        let mut card_rects: Vec<(i64, egui::Rect)> = Vec::new();
         let scroll = egui::ScrollArea::vertical()
             .max_height(SCROLL_MAX_HEIGHT)
+            .drag_to_scroll(false)
             .auto_shrink([false, false]);
-        scroll.show(ui, |ui| {
+        let mut scroll_output = scroll.show(ui, |ui| {
             for (date_label, group_photos) in &groups {
                 render_date_divider(ui, date_label);
 
@@ -329,10 +346,11 @@ impl LibraryPage {
                             full_path: p.path.clone(),
                             thumb_bytes: bytes,
                             thumb_error: error,
+                            rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO),
                             config: ThumbCardConfig {
                                 cell_w: layout.cell_w,
-                                selectable: false,
-                                selected: false,
+                                selectable: true,
+                                selected: self.selected_ids.contains(&p.id),
                                 in_catalog: false,
                                 label_override: None,
                             },
@@ -351,8 +369,117 @@ impl LibraryPage {
                     },
                 );
                 remove_ids.extend(group_removed);
+
+                // Sync click-to-select changes back to selected_ids.
+                for item in &items {
+                    if let Some(id) = item.id {
+                        if item.config.selected {
+                            self.selected_ids.insert(id);
+                        } else {
+                            self.selected_ids.remove(&id);
+                        }
+                    }
+                }
+
+                // Collect card rects for rubber-band hit-testing.
+                for (i, photo) in group_photos.iter().enumerate() {
+                    if i < items.len() {
+                        card_rects.push((photo.id, items[i].rect));
+                    }
+                }
+            }
+
+            // Rubber-band selection: track drag on the grid background.
+            // Only the primary (left) mouse button triggers selection.
+            let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+            let primary_down = ui.input(|i| i.pointer.primary_down());
+            let any_released = ui.input(|i| i.pointer.any_released());
+
+            // Start rubber band on left-click in empty space.
+            if primary_down && !self.rubber_band_active {
+                if let Some(pos) = pointer_pos {
+                    let on_card = card_rects.iter().any(|(_, r)| r.contains(pos));
+                    if !on_card {
+                        self.rubber_band_origin = Some(pos);
+                        self.rubber_band_current = Some(pos);
+                        self.rubber_band_active = true;
+                        self.selected_ids.clear();
+                    }
+                }
+            }
+
+            // Update and draw the selection rect.
+            if self.rubber_band_active {
+                if let Some(pos) = pointer_pos {
+                    self.rubber_band_current = Some(pos);
+                }
+
+                if let (Some(origin), Some(current)) = (self.rubber_band_origin, self.rubber_band_current) {
+                    let rect = egui::Rect::from_two_pos(origin, current);
+                    if rect.width().abs() > 4.0 || rect.height().abs() > 4.0 {
+                        let rect = egui::Rect::from_min_max(
+                            rect.min.min(rect.max),
+                            rect.min.max(rect.max),
+                        );
+                        ui.painter().rect_stroke(
+                            rect,
+                            0.0,
+                            egui::Stroke::new(1.5, egui::Color32::WHITE),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().rect_filled(
+                            rect,
+                            0.0,
+                            egui::Color32::from_black_alpha(48),
+                        );
+
+                        self.selected_ids = card_rects
+                            .iter()
+                            .filter(|(_, r)| r.intersects(rect))
+                            .map(|(id, _)| *id)
+                            .collect();
+                    }
+                }
+            }
+
+            // End rubber band on pointer release.
+            if any_released && self.rubber_band_active {
+                self.rubber_band_active = false;
+                self.rubber_band_origin = None;
+                self.rubber_band_current = None;
             }
         });
+
+        // Auto-scroll: when the rubber band reaches the viewport edge,
+        // scroll the grid so the user can select beyond the visible area.
+        if self.rubber_band_active {
+            if let Some(current) = self.rubber_band_current {
+                let top = scroll_output.inner_rect.min.y;
+                let bottom = scroll_output.inner_rect.max.y;
+                const EDGE_THRESHOLD: f32 = 40.0;
+                const BASE_SPEED: f32 = 8.0;
+
+                if current.y < top + EDGE_THRESHOLD {
+                    let dist = (top + EDGE_THRESHOLD - current.y).clamp(0.0, EDGE_THRESHOLD);
+                    let speed = BASE_SPEED + dist / EDGE_THRESHOLD * 30.0;
+                    scroll_output.state.offset.y =
+                        (scroll_output.state.offset.y - speed).max(0.0);
+                    if let Some(ref mut cur) = self.rubber_band_current {
+                        cur.y = (cur.y - speed).max(top);
+                    }
+                }
+                if current.y > bottom - EDGE_THRESHOLD {
+                    let dist = (current.y - (bottom - EDGE_THRESHOLD)).clamp(0.0, EDGE_THRESHOLD);
+                    let speed = BASE_SPEED + dist / EDGE_THRESHOLD * 30.0;
+                    scroll_output.state.offset.y += speed;
+                    if let Some(ref mut cur) = self.rubber_band_current {
+                        cur.y += speed;
+                    }
+                }
+
+                scroll_output.state.store(ctx, scroll_output.id);
+            }
+        }
 
         // Handle any remove requests from the context menu.
         for id in remove_ids {
