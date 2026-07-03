@@ -17,9 +17,11 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
+use time::OffsetDateTime;
 
 use crate::catalog::Catalog;
 use crate::import::exif::extract_exif;
+use crate::import::ImportAction;
 use crate::task::{GroupId, Task, TaskContext, TaskManager};
 
 /// Attach a group to a task only if `parent_group` is `Some`. Lets the
@@ -68,6 +70,8 @@ pub fn import_batch(
     files: Vec<ImportFile>,
     label: impl Into<String>,
     parent_group: Option<GroupId>,
+    action: ImportAction,
+    collection_path: Option<PathBuf>,
 ) -> Receiver<ImportSummary> {
     let _ = label; // reserved for the future "Import batch #N" naming.
     let (summary_tx, summary_rx) = channel::<ImportSummary>();
@@ -111,6 +115,7 @@ pub fn import_batch(
         let path = f.path.clone();
         let catalog = catalog.clone();
         let summary_acc = summary_acc_tx.clone();
+        let collection_path = collection_path.clone();
 
         let task = attach_group(
             Task::new(
@@ -124,7 +129,13 @@ pub fn import_batch(
         )
         .work(move |ctx: &TaskContext| {
             ctx.set_message("hashing");
-            let result = process_one(&path, &catalog, ctx);
+            let result = process_one(
+                &path,
+                &catalog,
+                ctx,
+                action,
+                collection_path.as_deref(),
+            );
             let update = match &result {
                 Ok(ImportOutcome::Imported) => ImportUpdate::Imported,
                 Ok(ImportOutcome::Duplicate) => ImportUpdate::Duplicate,
@@ -176,6 +187,8 @@ fn process_one(
     path: &Path,
     catalog: &Catalog,
     ctx: &TaskContext,
+    action: ImportAction,
+    collection_path: Option<&Path>,
 ) -> Result<ImportOutcome, ImportErr> {
     if ctx.is_cancelled() {
         return Err(ImportErr::Io(std::io::Error::new(
@@ -209,42 +222,158 @@ fn process_one(
     }
     // EXIF parse errors are non-fatal; we still keep the path / size.
 
+    // Hash from the SOURCE (single full-file read). The SHA1 is
+    // content-based so it's valid regardless of where the file sits.
     ctx.set_message("hashing");
     ctx.set_progress(0.15);
     let sha1 = sha1_file_with_progress(path, |frac| {
-        ctx.set_progress(0.15 + frac * 0.7);
+        ctx.set_progress(0.15 + frac * 0.45);
     })?;
     insert.sha1 = Some(sha1.to_vec());
 
-    // "Check then write" -- hold the catalog's write lock for the
+    // Compute destination and copy/move the file before taking the
+    // write lock. This keeps the expensive I/O outside the critical
+    // section so other import tasks aren't blocked.
+    let work_path: PathBuf;
+    if let Some(coll) = collection_path {
+        let dest = destination_path(path, coll, insert.date_taken);
+        if dest != path {
+            ctx.set_message(match action {
+                ImportAction::Copy => "copying to collection",
+                ImportAction::Move => "moving to collection",
+            });
+            ctx.set_progress(0.65);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            match action {
+                ImportAction::Copy => {
+                    std::fs::copy(path, &dest)?;
+                }
+                ImportAction::Move => {
+                    if let Err(_) = std::fs::rename(path, &dest) {
+                        std::fs::copy(path, &dest)?;
+                        std::fs::remove_file(path)?;
+                    }
+                }
+            }
+            insert.path = dest.to_string_lossy().into_owned();
+            if let Ok(meta) = std::fs::metadata(&dest) {
+                insert.file_size = Some(meta.len() as i64);
+                insert.mtime = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64);
+            }
+            work_path = dest;
+        } else {
+            work_path = path.to_path_buf();
+        }
+    } else {
+        work_path = path.to_path_buf();
+    }
+
+    // "Check then write" — hold the catalog's write lock for the
     // whole sequence so two background tasks can't both decide to
-    // write the same row at the same time. The lock is short
-    // (a single hash lookup + a folder upsert + a row upsert, all
-    // in one quick transaction) so contention is negligible.
+    // write the same row at the same time. Since the hash was
+    // computed from the source, a concurrent task for the same
+    // content would have the same hash and this check serialises
+    // the insert under the lock.
     let _write_guard = catalog.write_lock();
     ctx.set_message("checking duplicates");
     ctx.set_progress(0.9);
     if let Some(other) = find_by_sha1(catalog, &sha1)?
         && other.path != insert.path
     {
-        // Same content, different path: skip the new path so we don't
-        // double-store. A more sophisticated pipeline might record both
-        // as alternates, but for now a single canonical row is enough.
+        // Another task already wrote this content while we were
+        // doing the copy. Clean up the duplicate file.
+        let _ = std::fs::remove_file(&work_path);
         ctx.set_message("duplicate content");
         return Ok(ImportOutcome::Duplicate);
     }
 
-    // Folder upsert.
-    if let Some(parent) = path.parent() {
+    ctx.set_message("ensuring folder");
+    ctx.set_progress(0.95);
+    if let Some(parent) = work_path.parent() {
         let fid = catalog.ensure_folder(parent)?;
         insert.folder_id = Some(fid);
     }
 
-    ctx.set_message("writing row");
-    ctx.set_progress(0.95);
+    ctx.set_progress(0.97);
     catalog.upsert_photo(&insert)?;
     ctx.set_progress(1.0);
     Ok(ImportOutcome::Imported)
+}
+
+/// Compute the destination path inside `collection_dir` using a
+/// `<YYYY>/<MM>/<DD>/<filename>` layout.
+///
+/// Date priority:
+/// 1. `date_taken` (from EXIF)
+/// 2. File creation (birth) time
+/// 3. Current time (import moment)
+///
+/// If the computed destination already exists on disk, a counter suffix
+/// is appended before the extension to avoid collisions.
+fn destination_path(
+    source: &Path,
+    collection_dir: &Path,
+    date_taken: Option<i64>,
+) -> PathBuf {
+    let ts = date_taken.unwrap_or_else(|| {
+        // Fallback: file creation / birth time.
+        let meta = std::fs::metadata(source).ok();
+        meta.and_then(|m| m.created().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            // Final fallback: current time.
+            .unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp())
+    });
+    let dt = OffsetDateTime::from_unix_timestamp(ts).unwrap_or_else(|_| OffsetDateTime::now_utc());
+    let year = dt.year();
+    let month: u8 = dt.month().into();
+    let day = dt.day();
+    let filename = source
+        .file_name()
+        .unwrap_or(std::ffi::OsStr::new("unknown"));
+
+    let base = collection_dir
+        .join(format!("{year:04}"))
+        .join(format!("{month:02}"))
+        .join(format!("{day:02}"))
+        .join(filename);
+
+    resolve_conflict(&base)
+}
+
+/// If `path` already exists on disk, append `_1`, `_2`, … before the
+/// extension until a free name is found.
+fn resolve_conflict(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for i in 1..=999 {
+        let candidate = parent.join(format!("{stem}_{i}{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Last resort: append a timestamp.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    parent.join(format!("{stem}_{stamp}{ext}"))
 }
 
 /// SHA-1 of a file, with a progress callback that fires roughly every
@@ -368,6 +497,7 @@ mod tests {
         let cat_path = cat_dir.path().join("cat.sqlite");
         let cat = Arc::new(Catalog::create(&cat_path).unwrap());
 
+        use crate::import::ImportAction;
         let mut mgr = TaskManager::new();
         let summary_rx = import_batch(
             &mut mgr,
@@ -375,6 +505,8 @@ mod tests {
             vec![ImportFile { path: photo }],
             "Test import",
             None,
+            ImportAction::Copy,
+            Some(cat.dir().to_path_buf()),
         );
 
         // Drain until the summary arrives.

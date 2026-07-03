@@ -67,6 +67,10 @@ pub struct ThumbCardConfig {
     /// If `Some`, use this text as the label instead of the
     /// caller's filename.
     pub label_override: Option<String>,
+    /// Show a selection checkbox in the top-left corner.
+    pub selectable: bool,
+    /// Current checked state (when `selectable` is true).
+    pub selected: bool,
 }
 
 impl Default for ThumbCardConfig {
@@ -75,6 +79,8 @@ impl Default for ThumbCardConfig {
             cell_w: THUMB_CELL,
             in_catalog: false,
             label_override: None,
+            selectable: false,
+            selected: false,
         }
     }
 }
@@ -88,6 +94,8 @@ pub struct CardResponse {
     /// `true` if the user clicked "Remove" in the card's context
     /// menu. The caller should handle the removal flow.
     pub remove_requested: bool,
+    /// `true` if the user clicked the selection checkbox.
+    pub checkbox_toggled: bool,
     /// Screen-space rectangle of the card, in the caller's coordinate
     /// space.
     pub rect: egui::Rect,
@@ -98,6 +106,7 @@ impl Default for CardResponse {
         Self {
             hovered: false,
             remove_requested: false,
+            checkbox_toggled: false,
             rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO),
         }
     }
@@ -196,7 +205,12 @@ where
     let card_h = image_h + INNER_MARGIN * 2.0 + if show_label { LABEL_H } else { 0.0 };
     let card_size = egui::vec2(cell_w, card_h);
 
-    let (card_rect, response) = ui.allocate_exact_size(card_size, egui::Sense::hover());
+    let sense = if config.selectable {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (card_rect, response) = ui.allocate_exact_size(card_size, sense);
     let response = response.on_hover_text(full_path);
 
     // Right-click context menu.
@@ -216,9 +230,12 @@ where
         }
     });
 
+    let checkbox_toggled = config.selectable && response.clicked();
+
     let card_response = CardResponse {
         hovered: response.hovered(),
         remove_requested: remove_clicked.get(),
+        checkbox_toggled,
         rect: card_rect,
     };
 
@@ -506,6 +523,9 @@ where
                     item.id,
                 );
                 item.rect = resp.rect;
+                if resp.checkbox_toggled {
+                    item.config.selected = !item.config.selected;
+                }
                 if resp.remove_requested && let Some(id) = item.id {
                     remove_ids.push(id);
                 }

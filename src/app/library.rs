@@ -334,6 +334,8 @@ impl LibraryPage {
                                 cell_w: layout.cell_w,
                                 in_catalog: false,
                                 label_override: None,
+                                selectable: false,
+                                selected: false,
                             },
                         }
                     })

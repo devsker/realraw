@@ -46,6 +46,7 @@ use crate::catalog::Catalog;
 use crate::import::discovery::{DiscoveredFile, KNOWN_EXTENSIONS};
 use crate::import::thumbnail::{extract_dialog_preview, Thumbnail};
 use crate::import::worker::{import_batch, ImportFile, ImportSummary};
+use crate::import::ImportAction;
 /// Maximum number of outstanding thumbnail requests.
 const MAX_INFLIGHT_THUMBS: usize = 48;
 /// Number of cell-rows of buffer ahead of the visible area that we keep
@@ -56,6 +57,8 @@ const ROW_LOOKAHEAD: usize = 2;
 pub struct DialogFile {
     pub path: PathBuf,
     pub already_in_catalog: bool,
+    /// User has ticked this file for import (in the grid checkbox).
+    pub selected: bool,
     /// Raw RGBA bytes for the thumbnail (filled by the thumb worker).
     pub thumb_bytes: Option<ThumbnailBytes>,
     /// `true` once we've sent the file's path to the thumbnail worker.
@@ -102,6 +105,9 @@ pub struct ImportDialog {
     import_in_flight: bool,
     pub(crate) import_summary_rx: Option<Receiver<ImportSummary>>,
 
+    /// Copy or move files into the collection.
+    pub action: ImportAction,
+
     /// Per-dialog texture cache. Keyed by file index. Dropped when the
     /// dialog closes.
     textures: Mutex<HashMap<crate::thumb_grid::CacheKey, egui::TextureHandle>>,
@@ -141,6 +147,7 @@ impl Default for ImportDialog {
             import_summary: None,
             import_in_flight: false,
             import_summary_rx: None,
+            action: ImportAction::Copy,
             textures: Mutex::new(HashMap::new()),
         }
     }
@@ -205,6 +212,7 @@ impl ImportDialog {
                             .map(|f| DialogFile {
                                 path: f.path,
                                 already_in_catalog: f.already_in_catalog,
+                                selected: !f.already_in_catalog,
                                 thumb_bytes: None,
                                 thumb_requested: false,
                                 thumb_ready: false,
@@ -399,7 +407,93 @@ impl ImportDialog {
                             self.import_summary = Some(summary);
                             should_close = true;
                         }
+
+                        // Action selector (Copy / Move).
+                        if let Some(cat) = &catalog {
+                            let coll = cat.dir().to_string_lossy().into_owned();
+                            ui.horizontal(|ui| {
+                                ui.label("Import to:");
+                                ui.radio_value(
+                                    &mut self.action,
+                                    ImportAction::Copy,
+                                    "Copy to collection",
+                                );
+                                ui.radio_value(
+                                    &mut self.action,
+                                    ImportAction::Move,
+                                    "Move to collection",
+                                );
+                            });
+                            ui.label(format!("Destination: {coll}/<YYYY/MM/DD/>"));
+                        } else {
+                            ui.label("No collection open — files will be referenced in-place.");
+                        }
+
                         self.show_grid(ctx, ui);
+
+                        // Bottom bar: import buttons.
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Import All").clicked()
+                                        && let Some(cat) = catalog.clone()
+                                    {
+                                        let files: Vec<ImportFile> = self
+                                            .files
+                                            .iter()
+                                            .map(|f| ImportFile {
+                                                path: f.path.clone(),
+                                            })
+                                            .collect();
+                                        let coll = cat.dir().to_path_buf();
+                                        self.import_summary_rx = Some(import_batch(
+                                            task_manager,
+                                            cat,
+                                            files,
+                                            "Import",
+                                            None,
+                                            self.action,
+                                            Some(coll),
+                                        ));
+                                        should_close = true;
+                                    }
+
+                                    let n_selected = self.files.iter().filter(|f| f.selected).count();
+                                    let import_selected_label =
+                                        format!("Import Selected ({n_selected})");
+                                    if ui
+                                        .add_enabled(
+                                            n_selected > 0,
+                                            egui::Button::new(import_selected_label),
+                                        )
+                                        .clicked()
+                                        && let Some(cat) = catalog.clone()
+                                    {
+                                        let files: Vec<ImportFile> = self
+                                            .files
+                                            .iter()
+                                            .filter(|f| f.selected)
+                                            .map(|f| ImportFile {
+                                                path: f.path.clone(),
+                                            })
+                                            .collect();
+                                        let coll = cat.dir().to_path_buf();
+                                        self.import_summary_rx = Some(import_batch(
+                                            task_manager,
+                                            cat,
+                                            files,
+                                            "Import",
+                                            None,
+                                            self.action,
+                                            Some(coll),
+                                        ));
+                                        should_close = true;
+                                    }
+                                },
+                            );
+                        });
                     }
                     Phase::Importing => {
                         ui.horizontal(|ui| {
@@ -429,36 +523,6 @@ impl ImportDialog {
                         }
                     }
                 }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if self.phase == Phase::Browsing {
-                                if ui.button("Import").clicked()
-                                    && let Some(cat) = catalog.clone()
-                                {
-                                    let files: Vec<ImportFile> = self
-                                        .files
-                                        .iter()
-                                        .map(|f| ImportFile {
-                                            path: f.path.clone(),
-                                        })
-                                        .collect();
-                                    self.import_summary_rx = Some(import_batch(
-                                        task_manager,
-                                        cat,
-                                        files,
-                                        "Import",
-                                        None,
-                                    ));
-                                    should_close = true;
-                                }
-                            }
-                        },
-                    );
-                });
             });
 
         if response.should_close() {
@@ -489,6 +553,8 @@ impl ImportDialog {
                     cell_w: layout.cell_w,
                     in_catalog: f.already_in_catalog,
                     label_override: None,
+                    selectable: true,
+                    selected: f.selected,
                 },
                 rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO),
             })
@@ -502,6 +568,13 @@ impl ImportDialog {
             420.0,
             |item| crate::thumb_grid::CacheKey::from_path(&item.full_path),
         );
+
+        // Sync checkbox state back to the dialog files.
+        for (i, item) in items.iter().enumerate() {
+            if let Some(f) = self.files.get_mut(i) {
+                f.selected = item.config.selected;
+            }
+        }
     }
 }
 
@@ -681,6 +754,7 @@ mod tests {
         d.files = vec![DialogFile {
             path: std::path::PathBuf::from("/no/such/file.jpg"),
             already_in_catalog: false,
+            selected: true,
             thumb_bytes: None,
             thumb_requested: true,
             thumb_ready: false,

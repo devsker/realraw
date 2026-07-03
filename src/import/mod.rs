@@ -29,6 +29,13 @@ pub use exif::{extract_exif, ExifData};
 pub use thumbnail::{extract_thumbnail, Thumbnail};
 pub use worker::{import_batch, ImportSummary};
 
+/// Whether imported files should be copied or moved into the collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportAction {
+    Copy,
+    Move,
+}
+
 /// What the user picked in the import dialog. Held by the dialog and the
 /// app shell; the worker reads it when the user presses "Import".
 #[derive(Debug, Clone)]
@@ -43,6 +50,8 @@ pub struct ImportOptions {
     /// Skip files that are already in the catalog (by path or by SHA1).
     /// Default: true.
     pub dedup: bool,
+    /// Copy or move files into the collection directory.
+    pub action: ImportAction,
 }
 
 impl Default for ImportOptions {
@@ -52,6 +61,7 @@ impl Default for ImportOptions {
             extensions: KNOWN_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
             recursive: true,
             dedup: true,
+            action: ImportAction::Copy,
         }
     }
 }
