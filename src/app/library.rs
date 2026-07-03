@@ -143,6 +143,9 @@ pub struct LibraryPage {
     /// Last load error (e.g. catalog query failure), if any.
     last_error: Option<String>,
 
+    /// Set to the photo id that was double-clicked this frame.
+    /// The central panel reads this and navigates to Develop mode.
+    pub activated_id: Option<i64>,
 }
 
 /// Per-photo thumbnail state held in the library's `HashMap`.
@@ -182,6 +185,7 @@ impl Default for LibraryPage {
             inflight_thumbs: AtomicUsize::new(0),
             last_error: None,
             remove_dialog: RemoveDialog::default(),
+            activated_id: None,
         }
     }
 }
@@ -273,6 +277,7 @@ impl LibraryPage {
         catalog: Arc<Catalog>,
         task_manager: &mut TaskManager,
     ) -> Option<usize> {
+        self.activated_id = None;
         self.pump_events(&catalog);
 
         if let Some(err) = &self.last_error {
@@ -336,12 +341,13 @@ impl LibraryPage {
                                 label_override: None,
                                 selectable: false,
                                 selected: false,
+                                clickable: true,
                             },
                         }
                     })
                     .collect();
 
-                let group_removed = thumb_grid::show_thumb_rows(
+                let (group_removed, group_activated) = thumb_grid::show_thumb_rows(
                     ctx,
                     ui,
                     &mut items,
@@ -352,6 +358,9 @@ impl LibraryPage {
                     },
                 );
                 remove_ids.extend(group_removed);
+                if let Some(id) = group_activated.into_iter().next() {
+                    self.activated_id = Some(id);
+                }
             }
         });
 

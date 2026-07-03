@@ -7,12 +7,20 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use crate::app::develop::DevelopSettings;
 use crate::app::library::LibraryPage;
 use crate::catalog::{Catalog, Counts};
 use crate::import::{ImportDialog, ImportSummary, dialog::Phase as DialogPhase};
 use crate::task::{TaskManager, TaskSnapshot, TaskStatus};
 
 type StartupResult = Option<(PathBuf, Catalog)>;
+
+/// Which page is currently shown in the central panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    Library,
+    Develop,
+}
 
 /// Top-level application state. Owned by eframe's run loop and rendered once
 /// per frame via the [`eframe::App`] impl below.
@@ -48,6 +56,12 @@ pub struct App {
     /// The in-window import dialog, when open. Drop to close.
     pub import_dialog: Option<ImportDialog>,
     
+    /// The currently visible page in the central panel.
+    pub current_page: Page,
+
+    /// Develop mode adjustment settings.
+    pub develop: DevelopSettings,
+
     /// The library page: thumbnail grid of every photo in the catalog.
     pub library: LibraryPage,
     
@@ -131,6 +145,8 @@ impl Default for App {
             catalog_counts: None,
             catalog_error: None,
             import_dialog: None,
+            current_page: Page::Library,
+            develop: DevelopSettings::default(),
             library: LibraryPage::default(),
             library_last_refresh_mtime_ms: None,
             library_needs_refresh: false,

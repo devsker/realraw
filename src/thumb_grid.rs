@@ -71,6 +71,9 @@ pub struct ThumbCardConfig {
     pub selectable: bool,
     /// Current checked state (when `selectable` is true).
     pub selected: bool,
+    /// Enable click/double-click interaction (e.g. for the library
+    /// page so double-click navigates to Develop mode).
+    pub clickable: bool,
 }
 
 impl Default for ThumbCardConfig {
@@ -81,6 +84,7 @@ impl Default for ThumbCardConfig {
             label_override: None,
             selectable: false,
             selected: false,
+            clickable: false,
         }
     }
 }
@@ -96,6 +100,9 @@ pub struct CardResponse {
     pub remove_requested: bool,
     /// `true` if the user clicked the selection checkbox.
     pub checkbox_toggled: bool,
+    /// `true` if the card was double-clicked. Used by the library to
+    /// navigate to Develop mode.
+    pub double_clicked: bool,
     /// Screen-space rectangle of the card, in the caller's coordinate
     /// space.
     pub rect: egui::Rect,
@@ -107,6 +114,7 @@ impl Default for CardResponse {
             hovered: false,
             remove_requested: false,
             checkbox_toggled: false,
+            double_clicked: false,
             rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO),
         }
     }
@@ -205,7 +213,7 @@ where
     let card_h = image_h + INNER_MARGIN * 2.0 + if show_label { LABEL_H } else { 0.0 };
     let card_size = egui::vec2(cell_w, card_h);
 
-    let sense = if config.selectable {
+    let sense = if config.selectable || config.clickable {
         egui::Sense::click()
     } else {
         egui::Sense::hover()
@@ -231,11 +239,13 @@ where
     });
 
     let checkbox_toggled = config.selectable && response.clicked();
+    let double_clicked = response.double_clicked();
 
     let card_response = CardResponse {
         hovered: response.hovered(),
         remove_requested: remove_clicked.get(),
         checkbox_toggled,
+        double_clicked,
         rect: card_rect,
     };
 
@@ -451,8 +461,7 @@ impl Default for GridItem {
 /// block so the partial trailing row stays at the same horizontal
 /// offset as the full rows above it.
 ///
-/// Returns the photo IDs of any cards where the user clicked "Remove"
-/// in the context menu.
+/// Returns a tuple of `(remove_ids, double_clicked_ids)`.
 pub fn show_thumb_grid<K, F>(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
@@ -460,7 +469,7 @@ pub fn show_thumb_grid<K, F>(
     textures: &Mutex<HashMap<K, egui::TextureHandle>>,
     max_height: f32,
     key_for: F,
-) -> Vec<i64>
+) -> (Vec<i64>, Vec<i64>)
 where
     K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
     F: Fn(&GridItem) -> K,
@@ -477,16 +486,14 @@ where
 /// Useful when the caller wants to embed the grid inside its own
 /// scroll area (e.g. to insert date dividers between groups).
 ///
-/// Returns the photo IDs of any cards where the user clicked "Remove"
-/// in the context menu. The caller should handle the removal flow
-/// (confirmation dialog, DB deletion, thumbnail cleanup).
+/// Returns a tuple of `(remove_ids, double_clicked_ids)`.
 pub(crate) fn show_thumb_rows<K, F>(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
     items: &mut [GridItem],
     textures: &Mutex<HashMap<K, egui::TextureHandle>>,
     key_for: F,
-) -> Vec<i64>
+) -> (Vec<i64>, Vec<i64>)
 where
     K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
     F: Fn(&GridItem) -> K,
@@ -494,6 +501,7 @@ where
     let layout = compute_grid(ui);
     let n = items.len();
     let mut remove_ids = Vec::new();
+    let mut activate_ids = Vec::new();
 
     for (row_idx, row_start) in (0..n).step_by(layout.cells_per_row).enumerate() {
         let row_end = (row_start + layout.cells_per_row).min(n);
@@ -507,18 +515,15 @@ where
             ui.add_space(pad);
             ui.spacing_mut().item_spacing.x = COL_SPACING;
             for item in items[row_start..row_end].iter_mut() {
-                let bytes = item.thumb_bytes.as_ref();
-                let error = item.thumb_error.as_deref();
-                let path = item.full_path.clone();
                 let cache_key = key_for(item);
                 let resp = thumb_card(
                     ctx,
                     ui,
                     cache_key,
                     &item.config,
-                    bytes,
-                    error,
-                    &path,
+                    item.thumb_bytes.as_ref(),
+                    item.thumb_error.as_deref(),
+                    &item.full_path,
                     textures,
                     item.id,
                 );
@@ -529,6 +534,9 @@ where
                 if resp.remove_requested && let Some(id) = item.id {
                     remove_ids.push(id);
                 }
+                if resp.double_clicked && let Some(id) = item.id {
+                    activate_ids.push(id);
+                }
             }
         });
         let _ = resp;
@@ -537,7 +545,7 @@ where
         }
     }
 
-    remove_ids
+    (remove_ids, activate_ids)
 }
 
 /// Open the system's file manager at the folder containing `path` and

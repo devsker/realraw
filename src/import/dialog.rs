@@ -555,6 +555,7 @@ impl ImportDialog {
                     label_override: None,
                     selectable: true,
                     selected: f.selected,
+                    clickable: false,
                 },
                 rect: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::ZERO),
             })
