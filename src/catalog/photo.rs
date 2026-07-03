@@ -208,6 +208,15 @@ impl Catalog {
         }
     }
 
+    /// Delete a photo by its id. Returns `true` if a row was actually
+    /// removed. Foreign key cascades (`ON DELETE CASCADE`) handle
+    /// `collection_photos` and `photo_keywords` automatically.
+    pub fn delete_photo(&self, id: i64) -> Result<bool> {
+        let conn = self.pool.get()?;
+        let affected = conn.execute("DELETE FROM photos WHERE id = ?1", [id])?;
+        Ok(affected > 0)
+    }
+
     /// Set of absolute paths already in the catalog.
     pub fn existing_paths(&self) -> Result<std::collections::HashSet<String>> {
         let conn = self.pool.get()?;

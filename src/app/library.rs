@@ -18,8 +18,12 @@ use std::thread;
 use eframe::egui;
 use time::OffsetDateTime;
 
+use std::sync::Arc;
+
 use crate::catalog::thumbnail_cache;
 use crate::catalog::{Catalog, Photo};
+use crate::photo_ops::RemoveDialog;
+use crate::task::TaskManager;
 use crate::thumb_grid::{self, GridItem, ThumbCardConfig, ThumbnailBytes};
 
 /// Maximum number of outstanding thumbnail requests at any time.
@@ -125,6 +129,8 @@ pub struct LibraryPage {
     /// refresh happens while a thumb is loading, the result is
     /// still kept and reused.
     thumbs: HashMap<i64, ThumbState>,
+
+    remove_dialog: RemoveDialog,
     /// GPU textures, keyed by `CacheKey` (the photo's database id
     /// in the library; the path-hash in the import dialog). Owned
     /// by the page so they live as long as the photos do.
@@ -174,6 +180,7 @@ impl Default for LibraryPage {
             thumb_rx,
             inflight_thumbs: AtomicUsize::new(0),
             last_error: None,
+            remove_dialog: RemoveDialog::default(),
         }
     }
 }
@@ -262,9 +269,10 @@ impl LibraryPage {
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
-        catalog: &Catalog,
+        catalog: Arc<Catalog>,
+        task_manager: &mut TaskManager,
     ) -> Option<usize> {
-        self.pump_events(catalog);
+        self.pump_events(&catalog);
 
         if let Some(err) = &self.last_error {
             ui.colored_label(egui::Color32::LIGHT_RED, err);
@@ -289,19 +297,20 @@ impl LibraryPage {
         // Pre-load cached thumbnails from disk before spawning
         // workers. This prevents the infinite spinner on restart
         // when the disk cache already has the thumbnail.
-        self.preload_cached_thumbs(catalog);
+        self.preload_cached_thumbs(&catalog);
 
         // Request thumbnails for every photo that doesn't have one
         // yet. The `inflight_thumbs` counter already caps the
         // number of in-flight extractions at MAX_INFLIGHT_THUMBS,
         // so this just keeps the work queue topped up.
         let layout = thumb_grid::compute_grid(ui);
-        self.request_thumbs(catalog);
+        self.request_thumbs(&catalog);
 
         // Group photos by calendar day and render each group under
         // an inline date divider.
         let groups = group_by_date(&self.photos);
 
+        let mut remove_ids = Vec::new();
         let scroll = egui::ScrollArea::vertical()
             .max_height(SCROLL_MAX_HEIGHT)
             .auto_shrink([false, false]);
@@ -331,7 +340,7 @@ impl LibraryPage {
                     })
                     .collect();
 
-                thumb_grid::show_thumb_rows(
+                let group_removed = thumb_grid::show_thumb_rows(
                     ctx,
                     ui,
                     &mut items,
@@ -341,8 +350,23 @@ impl LibraryPage {
                         None => thumb_grid::CacheKey::from_path(&item.full_path),
                     },
                 );
+                remove_ids.extend(group_removed);
             }
         });
+
+        // Handle any remove requests from the context menu.
+        for id in remove_ids {
+            if let Some(photo) = self.photos.iter().find(|p| p.id == id) {
+                self.remove_dialog.request(id, &photo.path);
+            }
+        }
+
+        // Show the remove-confirmation dialog if one is pending.
+        // The dialog spawns a background task for the actual deletion.
+        if self.remove_dialog.show(ctx, task_manager, catalog.clone()).unwrap_or(false) {
+            self.refresh(&catalog, None);
+        }
+
         None
     }
 

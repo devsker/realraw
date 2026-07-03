@@ -17,6 +17,7 @@ pub mod app;
 pub mod catalog;
 pub mod demos;
 pub mod import;
+pub mod photo_ops;
 pub mod task;
 pub mod thumb_grid;
 

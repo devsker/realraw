@@ -97,6 +97,9 @@ pub struct CardResponse {
     pub clicked: bool,
     /// `true` if the card is currently being hovered.
     pub hovered: bool,
+    /// `true` if the user clicked "Remove" in the card's context
+    /// menu. The caller should handle the removal flow.
+    pub remove_requested: bool,
 }
 
 /// Grid metrics computed from the available width.
@@ -185,6 +188,7 @@ pub fn thumb_card<K>(
     thumb_error: Option<&str>,
     full_path: &str,
     textures: &Mutex<HashMap<K, egui::TextureHandle>>,
+    item_id: Option<i64>,
 ) -> CardResponse
 where
     K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
@@ -219,13 +223,14 @@ where
     // Reveal uses a helper that selects the file in the system file
     // manager — the `open` crate only opens the parent folder without
     // selection, so we use platform-specific commands instead.
+    let remove_clicked = std::cell::Cell::new(false);
     response.context_menu(|ui| {
         if ui.button("Open").clicked() {
             eprintln!("context menu: Open (not implemented)");
             ui.close_menu();
         }
-        if ui.button("Remove").clicked() {
-            eprintln!("context menu: Remove (not implemented)");
+        if item_id.is_some() && ui.button("Remove").clicked() {
+            remove_clicked.set(true);
             ui.close_menu();
         }
         if ui.button("Reveal").clicked() {
@@ -237,6 +242,7 @@ where
     let card_response = CardResponse {
         clicked: response.clicked(),
         hovered: response.hovered(),
+        remove_requested: remove_clicked.get(),
     };
 
     let selected = config.selected && !config.in_catalog;
@@ -445,6 +451,9 @@ pub struct GridItem {
 /// area constrained to `max_height`. Each row is a `ui.horizontal`
 /// block so the partial trailing row stays at the same horizontal
 /// offset as the full rows above it.
+///
+/// Returns the photo IDs of any cards where the user clicked "Remove"
+/// in the context menu.
 pub fn show_thumb_grid<K, F>(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
@@ -452,33 +461,42 @@ pub fn show_thumb_grid<K, F>(
     textures: &Mutex<HashMap<K, egui::TextureHandle>>,
     max_height: f32,
     key_for: F,
-) where
+) -> Vec<i64>
+where
     K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
     F: Fn(&GridItem) -> K,
 {
+    let mut remove_ids = Vec::new();
     let scroll = egui::ScrollArea::vertical()
         .max_height(max_height)
         .auto_shrink([false, false]);
     scroll.show(ui, |ui| {
-        show_thumb_rows(ctx, ui, items, textures, key_for);
+        remove_ids = show_thumb_rows(ctx, ui, items, textures, key_for);
     });
+    remove_ids
 }
 
 /// Row-by-row thumbnail grid rendering without a scroll wrapper.
 /// Useful when the caller wants to embed the grid inside its own
 /// scroll area (e.g. to insert date dividers between groups).
+///
+/// Returns the photo IDs of any cards where the user clicked "Remove"
+/// in the context menu. The caller should handle the removal flow
+/// (confirmation dialog, DB deletion, thumbnail cleanup).
 pub(crate) fn show_thumb_rows<K, F>(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
     items: &mut [GridItem],
     textures: &Mutex<HashMap<K, egui::TextureHandle>>,
     key_for: F,
-) where
+) -> Vec<i64>
+where
     K: std::hash::Hash + Eq + Copy + std::fmt::Display + Send,
     F: Fn(&GridItem) -> K,
 {
     let layout = compute_grid(ui);
     let n = items.len();
+    let mut remove_ids = Vec::new();
 
     for (row_idx, row_start) in (0..n).step_by(layout.cells_per_row).enumerate() {
         let row_end = (row_start + layout.cells_per_row).min(n);
@@ -499,7 +517,7 @@ pub(crate) fn show_thumb_rows<K, F>(
                 let error = item.thumb_error.as_deref();
                 let path = item.full_path.clone();
                 let cache_key = key_for(item);
-                let _ = thumb_card(
+                let resp = thumb_card(
                     ctx,
                     ui,
                     cache_key,
@@ -508,7 +526,11 @@ pub(crate) fn show_thumb_rows<K, F>(
                     error,
                     &path,
                     textures,
+                    item.id,
                 );
+                if resp.remove_requested && let Some(id) = item.id {
+                    remove_ids.push(id);
+                }
             }
         });
         let _ = resp;
@@ -517,6 +539,8 @@ pub(crate) fn show_thumb_rows<K, F>(
             ui.add_space(ROW_SPACING);
         }
     }
+
+    remove_ids
 }
 
 /// Open the system's file manager at the folder containing `path` and

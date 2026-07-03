@@ -26,7 +26,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
         }
         if let Some(cat) = &app.catalog {
             app.library.importing = app.import_summary_rx.is_some();
-            let _ = app.library.show(ctx, ui, cat);
+            let _ = app.library.show(ctx, ui, cat.clone(), &mut app.task_manager);
         }
     });
 }
