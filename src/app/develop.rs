@@ -40,11 +40,13 @@ impl Default for DevelopSettings {
 }
 
 fn slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>) {
-    ui.add(
-        egui::Slider::new(value, range)
-            .text(label)
-            .show_value(true),
-    );
+    ui.horizontal(|ui| {
+        ui.add_sized([80.0, 0.0], egui::Label::new(label));
+        ui.add(
+            egui::Slider::new(value, range)
+                .show_value(true),
+        );
+    });
 }
 
 fn section_header(ui: &mut egui::Ui, label: &str) {
