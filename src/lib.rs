@@ -9,13 +9,10 @@
 //!   both the import dialog and the main library page.
 //! * [`import`] -- photo import pipeline: discovery, EXIF, embedded
 //!   thumbnails, and the in-window import dialog.
-//! * [`demos`] -- sample task graphs (e.g. an import batch) that exercise
-//!   the task system and double as working feature stubs.
 //! * [`app`] -- top-level `App` state + eframe integration.
 
 pub mod app;
 pub mod catalog;
-pub mod demos;
 pub mod import;
 pub mod photo_ops;
 pub mod task;
