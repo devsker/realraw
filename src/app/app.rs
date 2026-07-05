@@ -97,6 +97,9 @@ pub struct App {
     /// True after the user confirmed quit; suppresses the dialog logic so the
     /// pending `ViewportCommand::Close` is not cancelled by a follow-up frame.
     pub closing: bool,
+
+    /// Tracks close button presses while dialog is open. Quits on 3rd press.
+    pub close_press_count: u32,
     
     /// Collection name entered in the setup dialog.
     pub setup_name: String,
@@ -156,6 +159,7 @@ impl Default for App {
             show_setup_dialog: false,
             show_close_dialog: false,
             closing: false,
+            close_press_count: 0,
             setup_name: String::new(),
             setup_dir: PathBuf::new(),
             setup_error: None,
@@ -282,6 +286,10 @@ impl eframe::App for App {
 
         if !self.closing {
             let close_requested = ctx.input(|i| i.viewport().close_requested());
+
+            if close_requested {
+                self.close_press_count += 1;
+            }
 
             if close_requested && !self.show_close_dialog {
                 self.show_close_dialog = true;
