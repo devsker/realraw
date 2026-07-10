@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -10,6 +11,9 @@ use super::decode::{
     decode_embedded_preview, decode_raw_preview, PreviewImage, PreviewSource,
 };
 use crate::catalog::thumbnail_cache;
+
+/// Crossfade duration from placeholder → demosaic (seconds).
+const FADE_SECS: f32 = 0.28;
 
 /// Result delivered from a background decode job.
 struct PreviewResult {
@@ -32,6 +36,10 @@ pub struct DevelopPreview {
     image: Option<PreviewImage>,
     /// GPU texture for `image`.
     texture: Option<egui::TextureHandle>,
+    /// Previous texture kept during placeholder → demosaic crossfade.
+    underlay: Option<egui::TextureHandle>,
+    /// When the crossfade started (`None` = not fading).
+    fade_start: Option<Instant>,
     /// Human-readable status while loading or on error.
     pub status: Option<String>,
     /// True while a background job for the current generation is in flight.
@@ -50,6 +58,8 @@ impl Default for DevelopPreview {
             generation: 0,
             image: None,
             texture: None,
+            underlay: None,
+            fade_start: None,
             status: None,
             loading: false,
             settled: false,
@@ -86,6 +96,8 @@ impl DevelopPreview {
         self.generation = self.generation.wrapping_add(1);
         self.image = None;
         self.texture = None;
+        self.underlay = None;
+        self.fade_start = None;
         self.loading = true;
         self.settled = false;
 
@@ -135,6 +147,8 @@ impl DevelopPreview {
         self.generation = self.generation.wrapping_add(1);
         self.image = None;
         self.texture = None;
+        self.underlay = None;
+        self.fade_start = None;
         self.loading = false;
         self.settled = true;
         self.status = Some(message);
@@ -146,6 +160,8 @@ impl DevelopPreview {
         self.generation = self.generation.wrapping_add(1);
         self.image = None;
         self.texture = None;
+        self.underlay = None;
+        self.fade_start = None;
         self.status = None;
         self.loading = false;
         self.settled = false;
@@ -168,14 +184,20 @@ impl DevelopPreview {
                             && cur.source != PreviewSource::DecoderPreview,
                     };
                     if replace {
-                        self.apply_image(ctx, img);
+                        self.apply_image(ctx, img, false);
                         if self.loading {
                             self.status = Some("Loading…".into());
                         }
                     }
                 }
                 ResultKind::Final(Ok(img)) => {
-                    self.apply_image(ctx, img);
+                    // Crossfade from placeholder when we already have one.
+                    let crossfade = self.texture.is_some()
+                        && matches!(
+                            self.image.as_ref().map(|i| i.source),
+                            Some(PreviewSource::CachedThumb | PreviewSource::Embedded)
+                        );
+                    self.apply_image(ctx, img, crossfade);
                     self.loading = false;
                     self.settled = true;
                     self.status = None;
@@ -192,15 +214,30 @@ impl DevelopPreview {
                 }
             }
         }
+
+        // Advance / finish crossfade.
+        if let Some(start) = self.fade_start {
+            if start.elapsed().as_secs_f32() >= FADE_SECS {
+                self.underlay = None;
+                self.fade_start = None;
+            }
+            need_repaint = true;
+        }
+
         if need_repaint {
             ctx.request_repaint();
         }
         if self.loading {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if self.fade_start.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 
-    fn apply_image(&mut self, ctx: &egui::Context, img: PreviewImage) {
+    /// Apply a decoded image. When `crossfade` is true, keep the previous
+    /// texture as an underlay and fade the new one in.
+    fn apply_image(&mut self, ctx: &egui::Context, img: PreviewImage, crossfade: bool) {
         let color = egui::ColorImage::from_rgba_unmultiplied(
             [img.width as usize, img.height as usize],
             &img.rgba,
@@ -210,13 +247,38 @@ impl DevelopPreview {
             self.photo_id.unwrap_or(0),
             img.source
         );
-        self.texture = Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR));
+        let new_tex = ctx.load_texture(name, color, egui::TextureOptions::LINEAR);
+
+        if crossfade {
+            // Move current texture to underlay for the fade-out layer.
+            self.underlay = self.texture.take();
+            self.fade_start = Some(Instant::now());
+        } else {
+            self.underlay = None;
+            self.fade_start = None;
+        }
+
+        self.texture = Some(new_tex);
         self.image = Some(img);
     }
 
-    /// Texture to draw, if any.
+    /// Texture to draw on top (current image), if any.
     pub fn texture(&self) -> Option<&egui::TextureHandle> {
         self.texture.as_ref()
+    }
+
+    /// Previous texture under the crossfade, if any.
+    pub fn underlay_texture(&self) -> Option<&egui::TextureHandle> {
+        self.underlay.as_ref()
+    }
+
+    /// Smoothstep fade progress for the top texture: `0` = fully transparent
+    /// (underlay only), `1` = fully opaque. `None` when not transitioning.
+    pub fn fade_progress(&self) -> Option<f32> {
+        let start = self.fade_start?;
+        let t = (start.elapsed().as_secs_f32() / FADE_SECS).clamp(0.0, 1.0);
+        // Smoothstep for a softer ease-in/out.
+        Some(t * t * (3.0 - 2.0 * t))
     }
 
     pub fn is_loading(&self) -> bool {

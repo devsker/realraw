@@ -145,6 +145,11 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
             .develop_preview
             .texture()
             .map(|t| (t.id(), t.size_vec2()));
+        let underlay = app
+            .develop_preview
+            .underlay_texture()
+            .map(|t| t.id());
+        let fade = app.develop_preview.fade_progress();
 
         if let Some((tex_id, size)) = tex_info {
             // Scale to fit available area (allow upscale) so the library
@@ -153,7 +158,17 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
             let scale = (avail.x / size.x).min(avail.y / size.y);
             let display = size * scale;
             ui.centered_and_justified(|ui| {
-                ui.image((tex_id, display));
+                let (rect, _) = ui.allocate_exact_size(display, egui::Sense::hover());
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                // Crossfade: underlay (thumb) full opacity, demosaic fades in.
+                if let Some(under_id) = underlay {
+                    ui.painter().image(under_id, rect, uv, egui::Color32::WHITE);
+                    let alpha = fade.unwrap_or(1.0);
+                    let tint = egui::Color32::from_white_alpha((alpha * 255.0) as u8);
+                    ui.painter().image(tex_id, rect, uv, tint);
+                } else {
+                    ui.painter().image(tex_id, rect, uv, egui::Color32::WHITE);
+                }
             });
             if loading {
                 if let Some(status) = status {
