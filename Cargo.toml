@@ -42,6 +42,7 @@ hex = "0.4"
 rawler = "0.7"
 egui-phosphor = "0.9"
 cacache-sync = "11"
+quick-xml = "0.41"
 
 [package.metadata.appimage]
 icon = "assets/icon-64.png"

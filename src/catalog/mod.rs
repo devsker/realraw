@@ -6,6 +6,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use refinery::embed_migrations;
 
+mod develop;
 mod error;
 pub mod folder;
 pub mod photo;
@@ -262,6 +263,25 @@ mod tests {
         assert!(
             cols.contains(&"thumbnail_status".to_string()),
             "V003 should add thumbnail_status; got {cols:?}"
+        );
+    }
+
+    #[test]
+    fn v004_migration_adds_photo_develop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.sqlite");
+        let cat = Catalog::create(&path).unwrap();
+        let conn = cat.pool().get().unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            tables.iter().any(|t| t == "photo_develop"),
+            "V004 should create photo_develop; got {tables:?}"
         );
     }
 

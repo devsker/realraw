@@ -6,6 +6,9 @@ use crate::app::app::Page;
 pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
     match app.current_page {
         Page::Library => {
+            // Leaving Develop: flush settings + any pending thumb refresh.
+            crate::app::develop::flush_develop(app);
+            crate::app::develop::flush_thumb_refresh(app);
             egui::CentralPanel::default().show(ctx, |ui| {
                 let mut needs_refresh = app.library_needs_refresh;
                 if !needs_refresh

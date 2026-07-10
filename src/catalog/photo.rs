@@ -113,6 +113,12 @@ pub struct PhotoInsert {
     pub file_format: Option<String>,
     pub file_extension: Option<String>,
     pub error: Option<String>,
+    /// Star rating from XMP (`None` → keep DB default 0).
+    pub rating: Option<i64>,
+    /// Color label id from XMP (`None` → keep DB default 0).
+    pub color_label: Option<i64>,
+    /// Keywords from XMP `dc:subject` (applied after upsert).
+    pub keywords: Vec<String>,
 }
 
 impl Catalog {
@@ -151,10 +157,28 @@ impl Catalog {
     }
 
     /// Insert or update a photo row, keyed by absolute path. Returns the
-    /// photo id.
+    /// photo id. When `p.keywords` is non-empty, replaces the photo's
+    /// keyword links.
     pub fn upsert_photo(&self, p: &PhotoInsert) -> Result<i64> {
         let conn = self.pool.get()?;
         upsert_photo(&conn, p, Self::now())
+    }
+
+    /// Keywords attached to a photo (ordered by name).
+    pub fn photo_keywords(&self, photo_id: i64) -> Result<Vec<String>> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT k.name FROM keywords k \
+             JOIN photo_keywords pk ON pk.keyword_id = k.id \
+             WHERE pk.photo_id = ?1 \
+             ORDER BY k.name",
+        )?;
+        let rows = stmt.query_map([photo_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// Bulk variant: a single transaction, much faster for large imports.
@@ -235,9 +259,11 @@ const PHOTO_COLUMNS: &str = "\
     orientation, date_taken, camera_make, camera_model, lens, \
     focal_length, aperture, shutter_speed, iso, \
     gps_lat, gps_lon, gps_altitude, copyright, \
-    file_format, file_extension, error";
+    file_format, file_extension, error, rating, color_label";
 
 fn upsert_photo(conn: &Connection, p: &PhotoInsert, now: i64) -> Result<i64> {
+    let rating = p.rating.unwrap_or(0);
+    let color_label = p.color_label.unwrap_or(0);
     let sql = format!(
         "INSERT INTO photos (imported_at, {cols}) \
          VALUES (?1, {placeholders}) \
@@ -263,7 +289,9 @@ fn upsert_photo(conn: &Connection, p: &PhotoInsert, now: i64) -> Result<i64> {
             copyright     = excluded.copyright, \
             file_format   = excluded.file_format, \
             file_extension= excluded.file_extension, \
-            error         = excluded.error \
+            error         = excluded.error, \
+            rating        = excluded.rating, \
+            color_label   = excluded.color_label \
          RETURNING id",
         cols = PHOTO_COLUMNS,
         placeholders = repeat_placeholders(PHOTO_COLUMNS.split(',').count())
@@ -293,9 +321,43 @@ fn upsert_photo(conn: &Connection, p: &PhotoInsert, now: i64) -> Result<i64> {
         &p.file_format,
         &p.file_extension,
         &p.error,
+        &rating,
+        &color_label,
     ];
     let id: i64 = conn.query_row(&sql, params_from_iter(params), |r| r.get(0))?;
+    if !p.keywords.is_empty() {
+        set_photo_keywords(conn, id, &p.keywords)?;
+    }
     Ok(id)
+}
+
+/// Replace the keyword set for `photo_id` with `keywords` (creates missing
+/// keyword rows). Empty `keywords` clears all links.
+fn set_photo_keywords(conn: &Connection, photo_id: i64, keywords: &[String]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM photo_keywords WHERE photo_id = ?1",
+        [photo_id],
+    )?;
+    for raw in keywords {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO keywords (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+            [name],
+        )?;
+        let kid: i64 = conn.query_row(
+            "SELECT id FROM keywords WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO photo_keywords (photo_id, keyword_id) VALUES (?1, ?2)",
+            [photo_id, kid],
+        )?;
+    }
+    Ok(())
 }
 
 fn upsert_photos_in_tx(conn: &mut Connection, items: &[PhotoInsert], now: i64) -> Result<usize> {
@@ -354,6 +416,25 @@ mod tests {
         assert_eq!(id1, id2, "upsert must return the same id");
         let row = cat.find_photo_by_path("/photos/a.jpg").unwrap().unwrap();
         assert_eq!(row.camera_make.as_deref(), Some("Nikon"));
+    }
+
+    #[test]
+    fn upsert_stores_rating_and_keywords() {
+        let dir = tempdir().unwrap();
+        let cat = Catalog::create(&dir.path().join("cat.sqlite")).unwrap();
+        let id = cat
+            .upsert_photo(&PhotoInsert {
+                path: "/photos/b.jpg".into(),
+                rating: Some(3),
+                color_label: Some(2),
+                keywords: vec!["alpha".into(), "beta".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let row = cat.find_photo_by_id(id).unwrap().unwrap();
+        assert_eq!(row.rating, 3);
+        assert_eq!(row.color_label, 2);
+        assert_eq!(cat.photo_keywords(id).unwrap(), vec!["alpha", "beta"]);
     }
 
     #[test]

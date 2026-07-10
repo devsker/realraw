@@ -7,10 +7,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use crate::app::develop::DevelopSettings;
 use crate::app::library::LibraryPage;
 use crate::catalog::{Catalog, Counts};
-use crate::develop::DevelopPreview;
+use crate::develop::{DevelopPreview, DevelopSettings};
 use crate::import::{ImportDialog, ImportSummary, dialog::Phase as DialogPhase};
 use crate::task::{TaskManager, TaskSnapshot, TaskStatus};
 
@@ -60,11 +59,25 @@ pub struct App {
     /// The currently visible page in the central panel.
     pub current_page: Page,
 
-    /// Develop mode adjustment settings.
+    /// Develop mode adjustment settings for the open photo.
     pub develop: DevelopSettings,
 
     /// Photo currently open in Develop (catalog id).
     pub develop_photo_id: Option<i64>,
+
+    /// Photo id whose settings are loaded into `develop` (for dirty flush).
+    pub develop_loaded_id: Option<i64>,
+
+    /// True when `develop` differs from last saved catalog/XMP state.
+    pub develop_dirty: bool,
+
+    /// True while a develop slider is being dragged (defer XMP write).
+    pub develop_dragging: bool,
+
+    /// Debounced library thumbnail refresh after develop edits.
+    /// `(photo_id, last_change_at)` — fires once quiet for
+    /// [`crate::app::develop::THUMB_REFRESH_DEBOUNCE`].
+    pub develop_thumb_due: Option<(i64, Instant)>,
 
     /// Progressive RAW preview for Develop mode.
     pub develop_preview: DevelopPreview,
@@ -158,6 +171,10 @@ impl Default for App {
             current_page: Page::Library,
             develop: DevelopSettings::default(),
             develop_photo_id: None,
+            develop_loaded_id: None,
+            develop_dirty: false,
+            develop_dragging: false,
+            develop_thumb_due: None,
             develop_preview: DevelopPreview::default(),
             library: LibraryPage::default(),
             library_last_refresh_mtime_ms: None,
@@ -217,6 +234,12 @@ impl eframe::App for App {
         // Drain background progress into the manager every frame.
         self.task_manager.sync();
         self.last_snapshot = self.task_manager.snapshot();
+
+        // Apply developed-thumb results even while on the Develop page.
+        if let Some(cat) = self.catalog.as_ref() {
+            self.library.pump_events(cat);
+        }
+        crate::app::develop::pump_thumb_refresh(self, ctx);
 
         // Counters used by both the menubar badge and the bottom panel.
         let total = self.last_snapshot.tasks.len();

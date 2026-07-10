@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 
 use crate::catalog::Catalog;
 use crate::import::exif::extract_exif;
+use crate::import::xmp::{find_sidecar, parse_xmp_file, sidecar_dest_for};
 use crate::import::ImportAction;
 use crate::task::{GroupId, Task, TaskContext, TaskManager};
 
@@ -123,7 +124,7 @@ pub fn import_batch(
                     "Import {}",
                     path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
                 ),
-                "Hash + EXIF + upsert",
+                "Hash + EXIF + XMP + upsert",
             ),
             parent_group,
         )
@@ -212,7 +213,7 @@ fn process_one(
 
     // Build a fresh PhotoInsert from the path and a freshly-read EXIF
     // block, then hash the file. All of this is local (filesystem +
-    // EXIF parsing), no SQLite involved.
+    // EXIF / XMP parsing), no SQLite involved.
     let mut insert = Catalog::photo_insert_from_path(path)?;
 
     ctx.set_message("reading EXIF");
@@ -221,6 +222,18 @@ fn process_one(
         exif.apply_to(&mut insert);
     }
     // EXIF parse errors are non-fatal; we still keep the path / size.
+
+    // XMP sidecar (rating, keywords, label, develop, …). Non-fatal if missing/broken.
+    let source_sidecar = find_sidecar(path);
+    let mut xmp_develop = None;
+    if let Some(ref side) = source_sidecar {
+        ctx.set_message("reading XMP");
+        ctx.set_progress(0.08);
+        if let Ok(xmp) = parse_xmp_file(side) {
+            xmp.apply_to(&mut insert);
+            xmp_develop = xmp.develop;
+        }
+    }
 
     // Hash from the SOURCE (single full-file read). The SHA1 is
     // content-based so it's valid regardless of where the file sits.
@@ -256,6 +269,20 @@ fn process_one(
                         std::fs::remove_file(path)?;
                     }
                 }
+            }
+            // Keep the XMP sidecar next to the image.
+            if let Some(ref side) = source_sidecar {
+                let dest_side = sidecar_dest_for(path, side, &dest);
+                let _ = match action {
+                    ImportAction::Copy => std::fs::copy(side, &dest_side).map(|_| ()),
+                    ImportAction::Move => {
+                        if std::fs::rename(side, &dest_side).is_err() {
+                            std::fs::copy(side, &dest_side).ok();
+                            let _ = std::fs::remove_file(side);
+                        }
+                        Ok(())
+                    }
+                };
             }
             insert.path = dest.to_string_lossy().into_owned();
             if let Ok(meta) = std::fs::metadata(&dest) {
@@ -301,7 +328,12 @@ fn process_one(
     }
 
     ctx.set_progress(0.97);
-    catalog.upsert_photo(&insert)?;
+    let photo_id = catalog.upsert_photo(&insert)?;
+    if let Some(ref dev) = xmp_develop
+        && !dev.is_identity()
+    {
+        let _ = catalog.set_develop(photo_id, dev);
+    }
     ctx.set_progress(1.0);
     Ok(ImportOutcome::Imported)
 }
@@ -523,5 +555,123 @@ mod tests {
         assert_eq!(summary.imported, 1, "summary: {summary:?}");
         assert_eq!(summary.errors, 0, "summary: {summary:?}");
         assert_eq!(cat.counts().unwrap().photos, 1);
+    }
+
+    #[test]
+    fn import_applies_xmp_sidecar_and_copies_it() {
+        use crate::import::xmp::{serialize_xmp, XmpData};
+
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let photo = src.join("shot.jpg");
+        write_jpeg(&photo);
+
+        let xmp = XmpData {
+            rating: Some(4),
+            label: Some("Blue".into()),
+            keywords: vec!["beach".into(), "ocean".into()],
+            copyright: Some("© Test".into()),
+            ..Default::default()
+        };
+        // Adobe-style sidecar next to the image.
+        std::fs::write(src.join("shot.jpg.xmp"), serialize_xmp(&xmp)).unwrap();
+
+        let cat_dir = tempdir().unwrap();
+        let cat = Arc::new(Catalog::create(&cat_dir.path().join("cat.sqlite")).unwrap());
+
+        let mut mgr = TaskManager::new();
+        let summary_rx = import_batch(
+            &mut mgr,
+            cat.clone(),
+            vec![ImportFile { path: photo }],
+            "XMP import",
+            None,
+            ImportAction::Copy,
+            Some(cat.dir().to_path_buf()),
+        );
+
+        let mut summary = ImportSummary::default();
+        for _ in 0..1000 {
+            mgr.sync();
+            if let Ok(s) = summary_rx.try_recv() {
+                summary = s;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(summary.imported, 1, "summary: {summary:?}");
+        assert_eq!(summary.errors, 0, "summary: {summary:?}");
+
+        let photos = cat.list_photos(None).unwrap();
+        assert_eq!(photos.len(), 1);
+        let p = &photos[0];
+        assert_eq!(p.rating, 4);
+        assert_eq!(p.color_label, 4); // Blue
+        assert_eq!(p.copyright.as_deref(), Some("© Test"));
+        let kws = cat.photo_keywords(p.id).unwrap();
+        assert_eq!(kws, vec!["beach", "ocean"]);
+
+        // Sidecar copied next to the destination image.
+        let dest_side = PathBuf::from(format!("{}.xmp", p.path));
+        assert!(
+            dest_side.is_file(),
+            "expected sidecar at {}",
+            dest_side.display()
+        );
+    }
+
+    #[test]
+    fn import_loads_develop_settings_from_xmp() {
+        use crate::develop::DevelopSettings;
+        use crate::import::xmp::{serialize_xmp, XmpData};
+
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let photo = src.join("dev.jpg");
+        write_jpeg(&photo);
+
+        let xmp = XmpData {
+            develop: Some(DevelopSettings {
+                exposure: 1.25,
+                contrast: 30.0,
+                shadows: 10.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        std::fs::write(src.join("dev.jpg.xmp"), serialize_xmp(&xmp)).unwrap();
+
+        let cat_dir = tempdir().unwrap();
+        let cat = Arc::new(Catalog::create(&cat_dir.path().join("cat.sqlite")).unwrap());
+
+        let mut mgr = TaskManager::new();
+        let summary_rx = import_batch(
+            &mut mgr,
+            cat.clone(),
+            vec![ImportFile { path: photo }],
+            "Develop import",
+            None,
+            ImportAction::Copy,
+            Some(cat.dir().to_path_buf()),
+        );
+
+        let mut summary = ImportSummary::default();
+        for _ in 0..1000 {
+            mgr.sync();
+            if let Ok(s) = summary_rx.try_recv() {
+                summary = s;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(summary.imported, 1, "summary: {summary:?}");
+
+        let p = &cat.list_photos(None).unwrap()[0];
+        let dev = cat.get_develop(p.id).unwrap();
+        assert!((dev.exposure - 1.25).abs() < 0.01);
+        assert!((dev.contrast - 30.0).abs() < 0.01);
+        assert!((dev.shadows - 10.0).abs() < 0.01);
     }
 }

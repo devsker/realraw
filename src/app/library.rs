@@ -243,6 +243,7 @@ impl LibraryPage {
                     Ok(bytes) => {
                         state.bytes = Some(bytes);
                         state.error = None;
+                        state.requested = true;
                         let key = thumb_grid::CacheKey::from_id(r.photo_id);
                         self.textures.lock().unwrap().remove(&key);
                         // Mark the thumbnail as ready in the DB so
@@ -266,6 +267,43 @@ impl LibraryPage {
                     }
                 }
             }
+        }
+    }
+
+    /// Low-priority background refresh: rebuild the library thumbnail from
+    /// develop linear + exposure and swap it in when ready. Keeps the old
+    /// thumb visible until the new one arrives.
+    pub fn schedule_developed_thumb_refresh(
+        &self,
+        catalog_dir: PathBuf,
+        photo_id: i64,
+        source_path: PathBuf,
+        orientation: Option<i64>,
+        exposure: f32,
+    ) {
+        self.inflight_thumbs.fetch_add(1, Ordering::Relaxed);
+        let tx = self.thumb_tx.clone();
+        let spawn = thread::Builder::new()
+            .name(format!("dev-thumb-{photo_id}"))
+            .spawn(move || {
+                // Yield so interactive develop-tone / import work stays snappy.
+                thread::sleep(std::time::Duration::from_millis(75));
+                let result = match std::panic::catch_unwind(|| {
+                    thumbnail_cache::regenerate_from_develop(
+                        &catalog_dir,
+                        photo_id,
+                        &source_path,
+                        orientation,
+                        exposure,
+                    )
+                }) {
+                    Ok(r) => r,
+                    Err(_) => Err("developed thumbnail worker panicked".into()),
+                };
+                let _ = tx.send(ThumbResult { photo_id, result });
+            });
+        if spawn.is_err() {
+            self.inflight_thumbs.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -393,11 +431,16 @@ impl LibraryPage {
                 Some(s) => s,
                 None => continue,
             };
+            // Skip only when we already hold decoded pixels. After a
+            // develop refresh, `bytes` is replaced in `pump_events`.
             if state.bytes.is_some() {
                 continue;
             }
             if let Some(bytes) = thumbnail_cache::load_thumbnail(catalog_dir, p.id) {
                 state.bytes = Some(bytes);
+                // Drop any GPU texture so the new disk bytes re-upload.
+                let key = thumb_grid::CacheKey::from_id(p.id);
+                self.textures.lock().unwrap().remove(&key);
             }
         }
     }

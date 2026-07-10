@@ -1,8 +1,11 @@
+use std::path::{Path, PathBuf};
+
 use eframe::egui;
 
 use crate::app::app::Page;
 use crate::app::App;
 use crate::catalog::Catalog;
+use crate::export;
 use crate::import::ImportDialog;
 
 pub(crate) fn render(app: &mut App, ctx: &egui::Context, show_badge: bool, overall_progress: f32) {
@@ -135,8 +138,8 @@ fn file_menu(ui: &mut egui::Ui, app: &mut App) {
     }
     ui.separator();
     if ui.button("Export...").clicked() {
-        app.toasts.add("Unimplemented");
         ui.close_menu();
+        export_current_photo(app);
     }
     ui.separator();
     if ui.button("Quit").clicked() {
@@ -160,7 +163,7 @@ pub(crate) fn try_open_catalog(app: &mut App, path: &std::path::Path) {
     }
 }
 
-pub(crate) fn try_new_catalog(app: &mut App, path: &std::path::Path) {
+pub(crate) fn try_new_catalog(app: &mut App, path: &Path) {
     match Catalog::create(path) {
         Ok(cat) => {
             Catalog::save_last_path(cat.path());
@@ -173,6 +176,54 @@ pub(crate) fn try_new_catalog(app: &mut App, path: &std::path::Path) {
             app.catalog_error = Some(format!("create failed: {e}"));
         }
     }
+}
+
+/// File → Export… : develop current photo with current exposure, save JPEG/PNG.
+fn export_current_photo(app: &mut App) {
+    let Some(id) = app.develop_photo_id else {
+        app.toasts
+            .add("Open a photo in Develop first (double-click in Library).");
+        return;
+    };
+    let Some(cat) = app.catalog.clone() else {
+        app.toasts.add("No catalog open");
+        return;
+    };
+    let photo = match cat.find_photo_by_id(id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            app.toasts.add("Photo not found in catalog");
+            return;
+        }
+        Err(e) => {
+            app.toasts.add(format!("Catalog error: {e}"));
+            return;
+        }
+    };
+
+    let default_name = Path::new(&photo.path)
+        .file_stem()
+        .map(|s| format!("{}.jpg", s.to_string_lossy()))
+        .unwrap_or_else(|| "export.jpg".into());
+
+    let Some(dest) = rfd::FileDialog::new()
+        .add_filter("JPEG", &["jpg", "jpeg"])
+        .add_filter("PNG", &["png"])
+        .set_file_name(&default_name)
+        .save_file()
+    else {
+        return;
+    };
+    let dest = export::ensure_export_extension(dest);
+
+    export::spawn_export_task(
+        &mut app.task_manager,
+        PathBuf::from(&photo.path),
+        photo.orientation,
+        app.develop.exposure,
+        dest,
+    );
+    app.toasts.add("Export started");
 }
 
 fn edit_menu(ui: &mut egui::Ui, app: &mut App) {

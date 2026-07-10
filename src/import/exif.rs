@@ -1,4 +1,6 @@
-//! EXIF / IPTC / XMP / capture metadata extraction.
+//! EXIF / capture metadata extraction.
+//!
+//! XMP sidecars are handled separately in [`crate::import::xmp`].
 //!
 //! Backed by [`kamadak_exif`], a pure-Rust parser that handles JPEG, TIFF,
 //! HEIF (CR3), PNG, and WebP directly. Because every mainstream raw

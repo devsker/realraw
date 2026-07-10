@@ -135,6 +135,64 @@ pub fn get_or_generate(
     })
 }
 
+/// Rebuild the library thumbnail from the develop linear buffer + exposure.
+///
+/// Prefers the on-disk linear demosaic cache (no rawler). Falls back to a
+/// full linear develop if the cache is cold. Always overwrites the JPEG
+/// thumbnail on disk. Also refreshes the develop sRGB preview cache so
+/// reopening the photo does not flash a stale EV=0 image.
+/// Intended for low-priority post-edit refresh.
+pub fn regenerate_from_develop(
+    catalog_dir: &Path,
+    photo_id: i64,
+    source_path: &Path,
+    orientation: Option<i64>,
+    exposure: f32,
+) -> Result<ThumbnailBytes, String> {
+    use crate::catalog::preview_cache;
+    use crate::develop::{apply_exposure, develop_linear, PreviewImage, PreviewSource, PREVIEW_MAX_DIM};
+
+    let linear = if let Some(lin) =
+        preview_cache::load_linear(catalog_dir, photo_id, orientation)
+    {
+        lin
+    } else {
+        let lin = develop_linear(source_path, orientation).map_err(|e| e.to_string())?;
+        let _ = preview_cache::save_linear(catalog_dir, photo_id, orientation, &lin);
+        lin
+    };
+
+    let img = apply_exposure(&linear, exposure, CACHE_MAX_DIM);
+    let thumb = Thumbnail {
+        width: img.width,
+        height: img.height,
+        rgba: img.rgba.clone(),
+        max_dim: CACHE_MAX_DIM,
+    };
+    save_thumbnail(catalog_dir, photo_id, &thumb).map_err(|e| e.to_string())?;
+
+    // Keep develop placeholder cache in sync with current exposure so a
+    // later open does not prefer a stale EV=0 demosaic JPEG.
+    let preview = apply_exposure(&linear, exposure, PREVIEW_MAX_DIM);
+    let _ = preview_cache::save_preview(
+        catalog_dir,
+        photo_id,
+        &PreviewImage {
+            width: preview.width,
+            height: preview.height,
+            rgba: preview.rgba,
+            source: PreviewSource::CachedPreview,
+        },
+    );
+
+    let small = resize_thumbnail(&thumb, CACHE_MAX_DIM);
+    Ok(ThumbnailBytes {
+        width: small.width,
+        height: small.height,
+        rgba: small.rgba,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

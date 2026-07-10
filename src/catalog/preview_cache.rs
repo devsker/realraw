@@ -1,18 +1,27 @@
 //! On-disk demosaic preview cache for Develop mode.
 //!
-//! Backed by [`cacache-sync`]: content-addressable, integrity-checked,
-//! concurrent-safe key/value storage under `{catalog_dir}/Previews/`.
+//! Under `{catalog_dir}/Previews/`:
 //!
-//! Values are JPEG (quality 92) at the develop preview resolution
-//! ([`crate::develop::PREVIEW_MAX_DIM`]).
+//! * **JPEG placeholder** (`cacache-sync` key `demosaic/{id}`) — sRGB
+//!   EV=0 paint for the first frame after open.
+//! * **Linear demosaic** (`linear/{shard}/{id}.rrln`) — f32 RGB buffer
+//!   so reopening a photo **skips** rawler demosaic entirely.
+//!
+//! Both are at develop preview resolution ([`crate::develop::PREVIEW_MAX_DIM`]).
 
-use std::io::Cursor;
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::develop::{PreviewImage, PreviewSource};
+use crate::develop::{LinearPreview, PreviewImage, PreviewSource, PREVIEW_MAX_DIM};
 
 const PREVIEWS_DIR: &str = "Previews";
+const LINEAR_DIR: &str = "linear";
 const JPEG_QUALITY: u8 = 92;
+const FILES_PER_SHARD: i64 = 32;
+
+/// Magic + version for `.rrln` linear cache files.
+const RRLN_MAGIC: &[u8; 4] = b"RRLN";
+const RRLN_VERSION: u32 = 1;
 
 /// Root directory of the demosaic preview cache.
 pub fn cache_dir(catalog_dir: &Path) -> PathBuf {
@@ -21,6 +30,18 @@ pub fn cache_dir(catalog_dir: &Path) -> PathBuf {
 
 fn cache_key(photo_id: i64) -> String {
     format!("demosaic/{photo_id}")
+}
+
+fn shard_id(photo_id: i64) -> i64 {
+    (photo_id.max(1) - 1) / FILES_PER_SHARD
+}
+
+/// Path of the linear demosaic buffer for `photo_id`.
+pub fn linear_path(catalog_dir: &Path, photo_id: i64) -> PathBuf {
+    cache_dir(catalog_dir)
+        .join(LINEAR_DIR)
+        .join(shard_id(photo_id).to_string())
+        .join(format!("{photo_id}.rrln"))
 }
 
 /// Load a cached demosaic preview. Returns `None` on miss or corruption
@@ -47,12 +68,91 @@ pub fn save_preview(
     Ok(())
 }
 
-/// Drop the index entry for `photo_id` (orphaned content is left for
-/// cacache; it will not be returned by future key lookups).
+/// Load a cached linear demosaic buffer, if valid for `orientation` and
+/// current [`PREVIEW_MAX_DIM`].
+pub fn load_linear(
+    catalog_dir: &Path,
+    photo_id: i64,
+    orientation: Option<i64>,
+) -> Option<LinearPreview> {
+    let path = linear_path(catalog_dir, photo_id);
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).ok()?;
+    if &magic != RRLN_MAGIC {
+        return None;
+    }
+    let mut hdr = [0u8; 4 + 4 + 4 + 8 + 4]; // ver, w, h, ori, max_dim
+    f.read_exact(&mut hdr).ok()?;
+    let version = u32::from_le_bytes(hdr[0..4].try_into().ok()?);
+    if version != RRLN_VERSION {
+        return None;
+    }
+    let width = u32::from_le_bytes(hdr[4..8].try_into().ok()?);
+    let height = u32::from_le_bytes(hdr[8..12].try_into().ok()?);
+    let stored_ori = i64::from_le_bytes(hdr[12..20].try_into().ok()?);
+    let max_dim = u32::from_le_bytes(hdr[20..24].try_into().ok()?);
+
+    let want_ori = orientation.unwrap_or(0);
+    if stored_ori != want_ori || max_dim != PREVIEW_MAX_DIM {
+        return None;
+    }
+    if width == 0 || height == 0 || width > PREVIEW_MAX_DIM * 2 || height > PREVIEW_MAX_DIM * 2 {
+        return None;
+    }
+
+    let n = width as usize * height as usize * 3;
+    let mut bytes = vec![0u8; n * 4];
+    f.read_exact(&mut bytes).ok()?;
+    // Reject trailing garbage / truncated files only if we can seek;
+    // exact read is enough for validity.
+    let mut rgb = Vec::with_capacity(n);
+    for chunk in bytes.chunks_exact(4) {
+        rgb.push(f32::from_le_bytes(chunk.try_into().ok()?));
+    }
+    Some(LinearPreview {
+        width,
+        height,
+        rgb,
+    })
+}
+
+/// Persist a linear demosaic buffer for fast reopen (skips rawler).
+pub fn save_linear(
+    catalog_dir: &Path,
+    photo_id: i64,
+    orientation: Option<i64>,
+    linear: &LinearPreview,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let target = linear_path(catalog_dir, photo_id);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = target.with_extension("rrln.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(RRLN_MAGIC)?;
+        f.write_all(&RRLN_VERSION.to_le_bytes())?;
+        f.write_all(&linear.width.to_le_bytes())?;
+        f.write_all(&linear.height.to_le_bytes())?;
+        f.write_all(&orientation.unwrap_or(0).to_le_bytes())?;
+        f.write_all(&PREVIEW_MAX_DIM.to_le_bytes())?;
+        for v in &linear.rgb {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &target)?;
+    Ok(())
+}
+
+/// Drop JPEG + linear cache entries for `photo_id`.
 pub fn remove_preview(catalog_dir: &Path, photo_id: i64) {
     let dir = cache_dir(catalog_dir);
     let key = cache_key(photo_id);
     let _ = cacache_sync::remove(&dir, &key);
+    let linear = linear_path(catalog_dir, photo_id);
+    let _ = std::fs::remove_file(linear);
 }
 
 fn encode_jpeg_preview(
@@ -146,5 +246,47 @@ mod tests {
         save_preview(dir.path(), 1, &sample_image(32, 16)).unwrap();
         let loaded = load_preview(dir.path(), 1).unwrap();
         assert_eq!((loaded.width, loaded.height), (32, 16));
+    }
+
+    fn sample_linear(w: u32, h: u32) -> LinearPreview {
+        let n = (w * h * 3) as usize;
+        let rgb: Vec<f32> = (0..n).map(|i| (i % 256) as f32 / 255.0).collect();
+        LinearPreview {
+            width: w,
+            height: h,
+            rgb,
+        }
+    }
+
+    #[test]
+    fn linear_roundtrip_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let lin = sample_linear(32, 24);
+        save_linear(dir.path(), 42, Some(1), &lin).unwrap();
+        let loaded = load_linear(dir.path(), 42, Some(1)).expect("load linear");
+        assert_eq!(loaded.width, 32);
+        assert_eq!(loaded.height, 24);
+        assert_eq!(loaded.rgb.len(), lin.rgb.len());
+        assert!((loaded.rgb[0] - lin.rgb[0]).abs() < 1e-6);
+        assert!((loaded.rgb[10] - lin.rgb[10]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn linear_miss_on_orientation_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        save_linear(dir.path(), 1, Some(1), &sample_linear(8, 8)).unwrap();
+        assert!(load_linear(dir.path(), 1, Some(6)).is_none());
+        assert!(load_linear(dir.path(), 1, Some(1)).is_some());
+    }
+
+    #[test]
+    fn remove_drops_linear_too() {
+        let dir = tempfile::tempdir().unwrap();
+        save_linear(dir.path(), 9, None, &sample_linear(4, 4)).unwrap();
+        save_preview(dir.path(), 9, &sample_image(4, 4)).unwrap();
+        assert!(load_linear(dir.path(), 9, None).is_some());
+        remove_preview(dir.path(), 9);
+        assert!(load_linear(dir.path(), 9, None).is_none());
+        assert!(load_preview(dir.path(), 9).is_none());
     }
 }
