@@ -9,6 +9,7 @@ use refinery::embed_migrations;
 mod error;
 pub mod folder;
 pub mod photo;
+pub mod preview_cache;
 pub mod thumbnail_cache;
 
 pub use error::{CatalogError, Result};

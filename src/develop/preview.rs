@@ -10,7 +10,7 @@ use eframe::egui;
 use super::decode::{
     decode_embedded_preview, decode_raw_preview, PreviewImage, PreviewSource,
 };
-use crate::catalog::thumbnail_cache;
+use crate::catalog::{preview_cache, thumbnail_cache};
 
 /// Crossfade duration from placeholder → demosaic (seconds).
 const FADE_SECS: f32 = 0.28;
@@ -78,9 +78,9 @@ impl DevelopPreview {
     /// Start loading `photo_id`.
     ///
     /// Progressive:
-    /// 1. Library `Thumbnails/` cache (fast, already generated)
-    /// 2. Else embedded JPEG from the RAW
-    /// 3. Full demosaic develop (authoritative)
+    /// 1. Demosaic disk cache (`Previews/`, cacache) — authoritative hit
+    /// 2. Library `Thumbnails/` / embedded JPEG placeholder
+    /// 3. Full demosaic develop → write through to disk cache
     pub fn open(
         &mut self,
         photo_id: i64,
@@ -116,8 +116,17 @@ impl DevelopPreview {
         thread::Builder::new()
             .name("develop-preview".into())
             .spawn(move || {
-                // Phase 1: prefer the library disk cache (same image as
-                // the grid), then fall back to extracting from the RAW.
+                // Phase 1: demosaic disk cache (skip re-decode on revisit).
+                if let Some(img) = preview_cache::load_preview(&catalog_dir, photo_id) {
+                    let _ = tx.send(PreviewResult {
+                        photo_id,
+                        generation: job_gen,
+                        kind: ResultKind::Final(Ok(img)),
+                    });
+                    return;
+                }
+
+                // Phase 2: library thumb / embedded JPEG for fast first paint.
                 let placeholder = load_cached_thumb(&catalog_dir, photo_id).or_else(|| {
                     decode_embedded_preview(&path, orientation).ok()
                 });
@@ -129,9 +138,16 @@ impl DevelopPreview {
                     });
                 }
 
-                // Phase 2: demosaic (or decoder RGB fallback).
+                // Phase 3: demosaic (or decoder RGB fallback), then cache.
                 let final_result =
                     decode_raw_preview(&path, orientation).map_err(|e| e.to_string());
+                if let Ok(ref img) = final_result {
+                    if let Err(e) = preview_cache::save_preview(&catalog_dir, photo_id, img) {
+                        eprintln!(
+                            "preview cache save failed for photo {photo_id}: {e}"
+                        );
+                    }
+                }
                 let _ = tx.send(PreviewResult {
                     photo_id,
                     generation: job_gen,
@@ -177,11 +193,10 @@ impl DevelopPreview {
             need_repaint = true;
             match r.kind {
                 ResultKind::Placeholder(img) => {
-                    // Only apply placeholder if we don't already have demosaic.
+                    // Only apply placeholder if we don't already have a final preview.
                     let replace = match &self.image {
                         None => true,
-                        Some(cur) => cur.source != PreviewSource::Demosaic
-                            && cur.source != PreviewSource::DecoderPreview,
+                        Some(cur) => !cur.source.is_final(),
                     };
                     if replace {
                         self.apply_image(ctx, img, false);

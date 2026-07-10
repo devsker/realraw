@@ -34,10 +34,22 @@ pub enum PreviewSource {
     CachedThumb,
     /// Camera-embedded JPEG (or scanned JPEG block).
     Embedded,
+    /// Demosaic preview loaded from the develop disk cache (`Previews/`).
+    CachedPreview,
     /// Full rawler demosaic pipeline.
     Demosaic,
     /// Decoder-provided preview/full RGB image (fallback).
     DecoderPreview,
+}
+
+impl PreviewSource {
+    /// `true` for authoritative develop previews (live or cached demosaic).
+    pub fn is_final(&self) -> bool {
+        matches!(
+            self,
+            Self::CachedPreview | Self::Demosaic | Self::DecoderPreview
+        )
+    }
 }
 
 /// Decoded preview ready for an egui texture.

@@ -22,8 +22,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-use crate::catalog::thumbnail_cache;
-use crate::catalog::Catalog;
+use crate::catalog::{preview_cache, thumbnail_cache, Catalog};
 use crate::task::{Task, TaskContext, TaskId, TaskManager};
 
 // ---------------------------------------------------------------------------
@@ -31,18 +30,23 @@ use crate::task::{Task, TaskContext, TaskId, TaskManager};
 // ---------------------------------------------------------------------------
 
 /// Delete a photo from the catalog database and remove its cached
-/// thumbnail from disk. Returns `true` if the photo existed and was
-/// deleted.
+/// thumbnail and demosaic preview from disk. Returns `true` if the
+/// photo existed and was deleted.
 ///
 /// This is a synchronous helper. For background deletion with progress
 /// reporting, use [`spawn_delete_task`] instead.
 pub fn delete_photo(catalog: &Catalog, photo_id: i64) -> Result<bool, String> {
     let deleted = catalog.delete_photo(photo_id).map_err(|e| e.to_string())?;
     if deleted {
-        let thumb_path = thumbnail_cache::thumbnail_path(catalog.dir(), photo_id);
-        let _ = std::fs::remove_file(&thumb_path);
+        remove_photo_caches(catalog.dir(), photo_id);
     }
     Ok(deleted)
+}
+
+fn remove_photo_caches(catalog_dir: &Path, photo_id: i64) {
+    let thumb_path = thumbnail_cache::thumbnail_path(catalog_dir, photo_id);
+    let _ = std::fs::remove_file(&thumb_path);
+    preview_cache::remove_preview(catalog_dir, photo_id);
 }
 
 /// Spawn a background task that deletes a photo from the catalog and
@@ -67,8 +71,7 @@ pub fn spawn_delete_task(
             .delete_photo(photo_id)
             .map_err(|e| format!("DB delete failed: {e}"))?;
         if deleted {
-            let thumb_path = thumbnail_cache::thumbnail_path(catalog.dir(), photo_id);
-            let _ = std::fs::remove_file(&thumb_path);
+            remove_photo_caches(catalog.dir(), photo_id);
         }
         Ok(())
     });
@@ -107,8 +110,7 @@ pub fn spawn_batch_delete_tasks(
                 .delete_photo(pid)
                 .map_err(|e| format!("DB delete failed: {e}"))?;
             if deleted {
-                let thumb_path = thumbnail_cache::thumbnail_path(cat.dir(), pid);
-                let _ = std::fs::remove_file(&thumb_path);
+                remove_photo_caches(cat.dir(), pid);
             }
             Ok(())
         });
