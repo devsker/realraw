@@ -1,5 +1,6 @@
 use eframe::egui;
 
+use crate::app::app::Page;
 use crate::app::App;
 use crate::catalog::Catalog;
 use crate::import::ImportDialog;
@@ -19,6 +20,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context, show_badge: bool, overa
                 }
             });
 
+            // Right side: modules (Library / Develop), then tasks badge.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if show_badge {
                     if ui
@@ -29,13 +31,82 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context, show_badge: bool, overa
                     }
                     ui.add(
                         egui::ProgressBar::new(overall_progress)
-                            .desired_width(110.0)
+                            .desired_width(100.0)
                             .show_percentage(),
                     );
+                    ui.add_space(12.0);
                 }
+
+                // right_to_left: add Develop first so order reads Library · Develop.
+                module_label(ui, app, Page::Develop, "Develop");
+                ui.add_space(16.0);
+                module_label(ui, app, Page::Library, "Library");
             });
         });
     });
+}
+
+/// Flat text module tab (no button chrome). Active = bright + underline.
+fn module_label(ui: &mut egui::Ui, app: &mut App, page: Page, label: &str) {
+    let selected = app.current_page == page;
+    let dark = ui.visuals().dark_mode;
+
+    // Size from a neutral galley, then paint with hover-aware color.
+    let font = egui::FontId::proportional(13.5);
+    let galley = ui.fonts(|f| {
+        f.layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::WHITE)
+    });
+    let size = galley.size() + egui::vec2(4.0, 6.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    let color = if selected {
+        if dark {
+            egui::Color32::from_rgb(235, 235, 235)
+        } else {
+            ui.visuals().strong_text_color()
+        }
+    } else if response.hovered() {
+        if dark {
+            egui::Color32::from_rgb(190, 190, 190)
+        } else {
+            ui.visuals().text_color()
+        }
+    } else if dark {
+        egui::Color32::from_rgb(130, 130, 130)
+    } else {
+        ui.visuals().weak_text_color()
+    };
+
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(), font, color));
+    let text_pos = egui::pos2(
+        rect.center().x - galley.size().x * 0.5,
+        rect.center().y - galley.size().y * 0.5,
+    );
+    ui.painter().galley(text_pos, galley, color);
+
+    if selected {
+        let y = rect.bottom() - 2.0;
+        let inset = 2.0;
+        let accent = if dark {
+            egui::Color32::from_rgb(210, 210, 210)
+        } else {
+            ui.visuals().strong_text_color()
+        };
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left() + inset, y),
+                egui::pos2(rect.right() - inset, y),
+            ],
+            egui::Stroke::new(1.5, accent),
+        );
+    }
+
+    if response.clicked() {
+        app.current_page = page;
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
 }
 
 fn file_menu(ui: &mut egui::Ui, app: &mut App) {
@@ -163,11 +234,11 @@ fn photo_menu(ui: &mut egui::Ui, app: &mut App) {
     }
     ui.separator();
     if ui.button("Go to Develop").clicked() {
-        app.toasts.add("Unimplemented");
+        app.current_page = Page::Develop;
         ui.close_menu();
     }
     if ui.button("Go to Library").clicked() {
-        app.toasts.add("Unimplemented");
+        app.current_page = Page::Library;
         ui.close_menu();
     }
     ui.separator();
