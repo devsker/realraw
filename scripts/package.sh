@@ -174,6 +174,7 @@ exec "$(dirname "$0")/usr/bin/realraw"
 APPRUN
     chmod +x "$appdir/AppRun"
     ln -s "usr/share/applications/$BIN_NAME.desktop" "$appdir/$BIN_NAME.desktop" 2>/dev/null || true
+    ln -s "usr/share/icons/hicolor/64x64/apps/realraw.png" "$appdir/realraw.png" 2>/dev/null || true
     ln -s "usr/share/icons/hicolor/64x64/apps/realraw.png" "$appdir/.DirIcon" 2>/dev/null || true
 
     # Download appimagetool if not cached
