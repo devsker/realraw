@@ -33,7 +33,7 @@ cargo test
 
 ## Packaging
 
-The binary can be packaged into platform-specific installers via `scripts/package.sh`:
+The binary can be packaged into platform-specific installers via `scripts/package.sh` (Unix) or `scripts\package.bat` (Windows):
 
 | Command | Requires | Output |
 |---------|----------|--------|
@@ -41,10 +41,20 @@ The binary can be packaged into platform-specific installers via `scripts/packag
 | `./scripts/package.sh dmg` | `cargo-bundle` + `brew install create-dmg` | `.dmg` disk image |
 | `./scripts/package.sh deb` | `cargo install cargo-deb` | `.deb` (Debian/Ubuntu) |
 | `./scripts/package.sh appimage` | `wget`, `desktop-file-validate` | AppImage (any Linux) |
-| `./scripts/package.sh exe` | nothing extra | `.exe` with icon embedded |
-| `./scripts/package.sh all` | all of the above | runs available commands for the current OS |
+| `package.sh exe` / `package.bat exe` | nothing extra | `.exe` with icon embedded |
+| `package.sh nsis` / `package.bat nsis` | [NSIS](https://nsis.sourceforge.io/) | `realraw-<ver>-setup.exe` |
+| `package.sh wix` / `package.bat wix` | [WiX Toolset v3](https://wixtoolset.org/) | `realraw-<ver>-x64.msi` |
+| `package.sh all` / `package.bat all` | tools for current OS | runs available commands |
+
+**Windows packaging tools (local, Scoop):**
+
+```bash
+scoop bucket add extras
+scoop install wixtoolset nsis
+```
 
 The Windows `.exe` icon is embedded automatically at compile time via `build.rs`.  
+Installer sources live in `packaging/windows/` (`realraw.nsi`, `realraw.wxs`).  
 The macOS `.icns` and Windows `.ico` are generated from `assets/icon-2048.png`.
 
 ## License

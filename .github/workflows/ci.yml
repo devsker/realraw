@@ -38,6 +38,16 @@ jobs:
         run: |
           cargo install cargo-deb
 
+      - name: Install packaging tools (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis wixtoolset -y --no-progress
+          # Refresh PATH for subsequent steps (chocolatey installs)
+          $machine = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+          $user = [System.Environment]::GetEnvironmentVariable("Path", "User")
+          echo "Path=$machine;$user" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build release binary
         run: cargo build --release
 
@@ -63,6 +73,8 @@ jobs:
           name: realraw-${{ matrix.label }}
           path: |
             target/release/realraw.exe
+            target/release/*-setup.exe
+            target/release/*.msi
             target/release/*.dmg
             target/debian/*.deb
             target/release/*.AppImage

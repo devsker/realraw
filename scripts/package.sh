@@ -5,6 +5,8 @@ cd "$(dirname "$0")/.."
 
 BIN_NAME="realraw"
 ACTION="${1:-help}"
+VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+VERSION="${VERSION:-0.1.0}"
 
 usage() {
     cat <<EOF
@@ -16,6 +18,8 @@ Commands:
   deb              Build .deb package for Debian/Ubuntu (requires cargo-deb)
   appimage         Build AppImage for Linux
   exe              Build Windows .exe (icon embedded automatically via build.rs)
+  nsis             Build Windows NSIS installer (.exe setup)
+  wix              Build Windows WiX MSI installer
   all              Run all available commands for the current OS
   help             Show this help
 EOF
@@ -24,9 +28,58 @@ EOF
 require_cmd() {
     if ! command -v "$1" &>/dev/null; then
         echo "error: '$1' is required but not installed."
-        echo "install with: cargo install $1"
+        if [ -n "${2:-}" ]; then
+            echo "install with: $2"
+        else
+            echo "install with: cargo install $1"
+        fi
         exit 1
     fi
+}
+
+# Resolve a Windows tool that may live under Program Files (Git Bash PATH often incomplete).
+find_win_cmd() {
+    local name="$1"
+    if command -v "$name" &>/dev/null; then
+        command -v "$name"
+        return 0
+    fi
+    local p
+    local home="${USERPROFILE:-$HOME}"
+    # Convert Windows path to Git Bash style if needed
+    home="${home//\\//}"
+    case "$home" in
+        [A-Za-z]:*) home="/${home:0:1}${home:2}" ;;
+    esac
+
+    for p in \
+        "$home/scoop/shims/${name}.exe" \
+        "$home/scoop/apps/nsis/current/${name}.exe" \
+        "$home/scoop/apps/wixtoolset/current/bin/${name}.exe" \
+        "/c/Program Files (x86)/NSIS/${name}.exe" \
+        "/c/Program Files/NSIS/${name}.exe" \
+        "/c/Program Files (x86)/WiX Toolset v3.14/bin/${name}.exe" \
+        "/c/Program Files (x86)/WiX Toolset v3.11/bin/${name}.exe" \
+        "/c/Program Files/WiX Toolset v3.14/bin/${name}.exe" \
+        ; do
+        if [ -x "$p" ] || [ -f "$p" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    # Glob WiX Toolset versions (MSI install) and Scoop versioned dirs
+    local match
+    match="$(ls -d "/c/Program Files (x86)/WiX Toolset v"*"/bin/${name}.exe" 2>/dev/null | head -n1 || true)"
+    if [ -n "$match" ] && [ -f "$match" ]; then
+        echo "$match"
+        return 0
+    fi
+    match="$(ls -d "$home/scoop/apps/wixtoolset/"*"/bin/${name}.exe" 2>/dev/null | head -n1 || true)"
+    if [ -n "$match" ] && [ -f "$match" ]; then
+        echo "$match"
+        return 0
+    fi
+    return 1
 }
 
 cmd_app_macos() {
@@ -112,6 +165,63 @@ cmd_exe() {
     echo "==> Done: target/release/$BIN_NAME.exe"
 }
 
+cmd_nsis() {
+    local makensis
+    if ! makensis="$(find_win_cmd makensis)"; then
+        echo "error: 'makensis' is required but not installed."
+        echo "install with:"
+        echo "  scoop bucket add extras"
+        echo "  scoop install wixtoolset nsis"
+        exit 1
+    fi
+
+    if [ ! -f "target/release/$BIN_NAME.exe" ]; then
+        cmd_exe
+    fi
+
+    echo "==> Building NSIS installer (v${VERSION})..."
+    "$makensis" -DVERSION="$VERSION" packaging/windows/realraw.nsi
+    echo "==> Done: target/release/${BIN_NAME}-${VERSION}-setup.exe"
+}
+
+cmd_wix() {
+    local candle light
+    if ! candle="$(find_win_cmd candle)"; then
+        echo "error: 'candle' (WiX Toolset v3) is required but not installed."
+        echo "install with:"
+        echo "  scoop bucket add extras"
+        echo "  scoop install wixtoolset nsis"
+        exit 1
+    fi
+    if ! light="$(find_win_cmd light)"; then
+        echo "error: 'light' (WiX Toolset v3) is required but not installed."
+        echo "install with:"
+        echo "  scoop bucket add extras"
+        echo "  scoop install wixtoolset nsis"
+        exit 1
+    fi
+
+    if [ ! -f "target/release/$BIN_NAME.exe" ]; then
+        cmd_exe
+    fi
+
+    local wixobj="target/release/${BIN_NAME}.wixobj"
+    local msi="target/release/${BIN_NAME}-${VERSION}-x64.msi"
+
+    echo "==> Building WiX MSI (v${VERSION})..."
+    "$candle" \
+        -nologo \
+        -arch x64 \
+        -dProductVersion="${VERSION}" \
+        -out "$wixobj" \
+        packaging/windows/realraw.wxs
+    "$light" \
+        -nologo \
+        -out "$msi" \
+        "$wixobj"
+    echo "==> Done: $msi"
+}
+
 cmd_all() {
     case "$(uname -s)" in
         Darwin)
@@ -128,6 +238,16 @@ cmd_all() {
             ;;
         MINGW*|MSYS*|CYGWIN*)
             cmd_exe
+            if find_win_cmd makensis &>/dev/null; then
+                cmd_nsis
+            else
+                echo "==> Skipping NSIS (makensis not found)"
+            fi
+            if find_win_cmd candle &>/dev/null && find_win_cmd light &>/dev/null; then
+                cmd_wix
+            else
+                echo "==> Skipping WiX (candle/light not found)"
+            fi
             ;;
         *)
             echo "unknown OS: $(uname -s)"
@@ -142,6 +262,8 @@ case "$ACTION" in
     deb)        cmd_deb ;;
     appimage)   cmd_appimage ;;
     exe)        cmd_exe ;;
+    nsis)       cmd_nsis ;;
+    wix)        cmd_wix ;;
     all)        cmd_all ;;
     help|--help|-h) usage ;;
     *)          echo "unknown command: $ACTION"; usage; exit 1 ;;
