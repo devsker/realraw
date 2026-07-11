@@ -11,7 +11,7 @@ use std::path::Path;
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::srgb::srgb_apply_gamma;
 
-use super::decode::{DecodeError, PreviewImage, PreviewSource, PREVIEW_MAX_DIM};
+use super::decode::{DecodeError, PreviewImage, PreviewSource};
 
 /// Linear (pre-gamma) develop buffer for interactive tone ops.
 #[derive(Debug, Clone)]
@@ -29,12 +29,15 @@ impl LinearPreview {
 }
 
 /// Demosaic + WB + calibrate, **without** sRGB gamma. Oriented and
-/// downscaled to [`PREVIEW_MAX_DIM`].
+/// downscaled so the longest edge is at most `max_dim` (use
+/// [`super::decode::PREVIEW_MAX_DIM`] for interactive previews, or `u32::MAX`
+/// for full-resolution export).
 pub fn develop_linear(
     path: &Path,
     orientation: Option<i64>,
+    max_dim: u32,
 ) -> Result<LinearPreview, DecodeError> {
-    develop_linear_with_progress(path, orientation, &mut |_| {})
+    develop_linear_with_progress(path, orientation, max_dim, &mut |_| {})
 }
 
 /// Same as [`develop_linear`], reporting coarse stage progress via
@@ -42,6 +45,7 @@ pub fn develop_linear(
 pub fn develop_linear_with_progress(
     path: &Path,
     orientation: Option<i64>,
+    max_dim: u32,
     on_progress: &mut dyn FnMut(f32),
 ) -> Result<LinearPreview, DecodeError> {
     if !super::decode::is_raw_path(path) {
@@ -49,7 +53,7 @@ pub fn develop_linear_with_progress(
     }
     on_progress(0.0);
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        develop_linear_inner(path, orientation, on_progress)
+        develop_linear_inner(path, orientation, max_dim, on_progress)
     })) {
         Ok(result) => result,
         Err(_) => Err(DecodeError::Raw(
@@ -61,6 +65,7 @@ pub fn develop_linear_with_progress(
 fn develop_linear_inner(
     path: &Path,
     orientation: Option<i64>,
+    max_dim: u32,
     on_progress: &mut dyn FnMut(f32),
 ) -> Result<LinearPreview, DecodeError> {
     on_progress(0.05);
@@ -104,9 +109,18 @@ fn develop_linear_inner(
     rgb = rgb2;
     on_progress(0.72);
 
+    if width <= max_dim && height <= max_dim {
+        on_progress(0.95);
+        return Ok(LinearPreview {
+            width,
+            height,
+            rgb,
+        });
+    }
+
     // Box-filter downsample is CPU-heavy on full-res demosaic; report rows.
     let (w3, h3, rgb3) =
-        downscale_rgb_with_progress(&rgb, width, height, PREVIEW_MAX_DIM, on_progress, 0.72, 0.95);
+        downscale_rgb_with_progress(&rgb, width, height, max_dim, on_progress, 0.72, 0.95);
     on_progress(0.95);
     Ok(LinearPreview {
         width: w3,

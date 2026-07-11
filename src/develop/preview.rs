@@ -221,7 +221,12 @@ impl DevelopPreview {
                             });
                         };
                         let result =
-                            develop_linear_with_progress(&path, orientation, &mut report);
+                            develop_linear_with_progress(
+                                &path,
+                                orientation,
+                                PREVIEW_MAX_DIM,
+                                &mut report,
+                            );
                         demosaic_report = Some(Box::new(report));
                         result
                     }

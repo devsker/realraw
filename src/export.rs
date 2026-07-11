@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::develop::{apply_exposure, develop_linear, PreviewImage, PREVIEW_MAX_DIM};
+use crate::develop::{apply_exposure, develop_linear, PreviewImage};
 use crate::task::{Task, TaskContext, TaskId, TaskManager};
 
 /// JPEG quality for exported files.
@@ -30,14 +30,16 @@ pub fn spawn_export_task(
             ctx.set_message("Developing…");
             ctx.set_progress(0.1);
 
-            let linear = develop_linear(&source, orientation).map_err(|e| e.to_string())?;
+            // Full resolution — do not use PREVIEW_MAX_DIM.
+            let linear =
+                develop_linear(&source, orientation, u32::MAX).map_err(|e| e.to_string())?;
             if ctx.is_cancelled() {
                 return Err("cancelled".into());
             }
             ctx.set_progress(0.65);
             ctx.set_message("Applying exposure…");
 
-            let img = apply_exposure(&linear, exposure, PREVIEW_MAX_DIM);
+            let img = apply_exposure(&linear, exposure, u32::MAX);
             if ctx.is_cancelled() {
                 return Err("cancelled".into());
             }

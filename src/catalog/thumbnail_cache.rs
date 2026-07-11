@@ -157,7 +157,8 @@ pub fn regenerate_from_develop(
     {
         lin
     } else {
-        let lin = develop_linear(source_path, orientation).map_err(|e| e.to_string())?;
+        let lin = develop_linear(source_path, orientation, PREVIEW_MAX_DIM)
+            .map_err(|e| e.to_string())?;
         let _ = preview_cache::save_linear(catalog_dir, photo_id, orientation, &lin);
         lin
     };
