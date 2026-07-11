@@ -38,32 +38,95 @@ echo   all     Build exe, then NSIS and WiX if tools are available
 echo   help    Show this help
 exit /b 0
 
-:cmd_exe
+:ensure_release_bin
+if exist "target\release\%BIN_NAME%.exe" (
+  echo ==^> Using existing target\release\%BIN_NAME%.exe
+  exit /b 0
+)
+echo ==^> Building release binary...
 where cargo >nul 2>&1
 if errorlevel 1 (
   echo error: 'cargo' is required but not installed.
   exit /b 1
 )
-echo ==^> Building release exe (icon embedded via build.rs)...
 cargo build --release
+exit /b 0
+
+:cmd_exe
+call :ensure_release_bin
 if errorlevel 1 exit /b 1
 echo ==^> Done: target\release\%BIN_NAME%.exe
 exit /b 0
 
-:cmd_nsis
+:find_makensis
 set "MAKENSIS="
 where makensis >nul 2>&1
 if not errorlevel 1 (
   for /f "delims=" %%P in ('where makensis') do (
     set "MAKENSIS=%%P"
-    goto :nsis_found
+    goto :eof
   )
 )
-if not defined MAKENSIS if exist "%USERPROFILE%\scoop\shims\makensis.exe" set "MAKENSIS=%USERPROFILE%\scoop\shims\makensis.exe"
-if not defined MAKENSIS if exist "%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" set "MAKENSIS=%USERPROFILE%\scoop\apps\nsis\current\makensis.exe"
-if not defined MAKENSIS if exist "%ProgramFiles(x86)%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles(x86)%\NSIS\makensis.exe"
-if not defined MAKENSIS if exist "%ProgramFiles%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles%\NSIS\makensis.exe"
-:nsis_found
+if exist "%GITHUB_WORKSPACE%\tools\nsis-3.10\makensis.exe" set "MAKENSIS=%GITHUB_WORKSPACE%\tools\nsis-3.10\makensis.exe" & goto :eof
+if exist "%~dp0..\tools\nsis-3.10\makensis.exe" set "MAKENSIS=%~dp0..\tools\nsis-3.10\makensis.exe" & goto :eof
+if exist "%~dp0..\tools\nsis\makensis.exe" set "MAKENSIS=%~dp0..\tools\nsis\makensis.exe" & goto :eof
+if exist "%USERPROFILE%\scoop\shims\makensis.exe" set "MAKENSIS=%USERPROFILE%\scoop\shims\makensis.exe" & goto :eof
+if exist "%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" set "MAKENSIS=%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" & goto :eof
+if exist "%ProgramFiles(x86)%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles(x86)%\NSIS\makensis.exe" & goto :eof
+if exist "%ProgramFiles%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles%\NSIS\makensis.exe" & goto :eof
+exit /b 1
+
+:find_candle
+set "CANDLE="
+where candle >nul 2>&1
+if not errorlevel 1 (
+  for /f "delims=" %%P in ('where candle') do (
+    set "CANDLE=%%P"
+    goto :find_light_stub
+  )
+)
+if exist "%GITHUB_WORKSPACE%\tools\wix\candle.exe" set "CANDLE=%GITHUB_WORKSPACE%\tools\wix\candle.exe" & goto :find_light_stub
+if exist "%~dp0..\tools\wix\candle.exe" set "CANDLE=%~dp0..\tools\wix\candle.exe" & goto :find_light_stub
+if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\candle.exe" set "CANDLE=%USERPROFILE%\scoop\apps\wixtoolset\current\bin\candle.exe" & goto :find_light_stub
+for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do (
+  if exist "%%D\bin\candle.exe" set "CANDLE=%%D\bin\candle.exe" & goto :find_light_stub
+)
+for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do (
+  if exist "%%D\bin\candle.exe" set "CANDLE=%%D\bin\candle.exe" & goto :find_light_stub
+)
+exit /b 1
+
+:find_light_stub
+if defined CANDLE (
+  for %%P in ("!CANDLE!") do if exist "%%~dpPlight.exe" set "LIGHT=%%~dpPlight.exe"
+)
+goto :eof
+
+:find_light
+set "LIGHT="
+where light >nul 2>&1
+if not errorlevel 1 (
+  for /f "delims=" %%P in ('where light') do (
+    set "LIGHT=%%P"
+    goto :eof
+  )
+)
+if exist "%GITHUB_WORKSPACE%\tools\wix\light.exe" set "LIGHT=%GITHUB_WORKSPACE%\tools\wix\light.exe" & goto :eof
+if exist "%~dp0..\tools\wix\light.exe" set "LIGHT=%~dp0..\tools\wix\light.exe" & goto :eof
+if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\light.exe" set "LIGHT=%USERPROFILE%\scoop\apps\wixtoolset\current\bin\light.exe" & goto :eof
+for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do (
+  if exist "%%D\bin\light.exe" set "LIGHT=%%D\bin\light.exe" & goto :eof
+)
+for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do (
+  if exist "%%D\bin\light.exe" set "LIGHT=%%D\bin\light.exe" & goto :eof
+)
+if defined CANDLE (
+  for %%P in ("!CANDLE!") do if exist "%%~dpPlight.exe" set "LIGHT=%%~dpPlight.exe"
+)
+exit /b 1
+
+:cmd_nsis
+call :find_makensis
 if not defined MAKENSIS (
   echo error: 'makensis' is required but not installed.
   echo install with:
@@ -71,10 +134,9 @@ if not defined MAKENSIS (
   echo   scoop install wixtoolset nsis
   exit /b 1
 )
-if not exist "target\release\%BIN_NAME%.exe" (
-  call :cmd_exe
-  if errorlevel 1 exit /b 1
-)
+call :ensure_release_bin
+if errorlevel 1 exit /b 1
+
 echo ==^> Building NSIS installer (v%VERSION%)...
 "%MAKENSIS%" /DVERSION=%VERSION% packaging\windows\realraw.nsi
 if errorlevel 1 exit /b 1
@@ -82,61 +144,8 @@ echo ==^> Done: target\release\%BIN_NAME%-%VERSION%-setup.exe
 exit /b 0
 
 :cmd_wix
-set "CANDLE="
-set "LIGHT="
-where candle >nul 2>&1
-if not errorlevel 1 (
-  for /f "delims=" %%P in ('where candle') do (
-    set "CANDLE=%%P"
-    goto :candle_found
-  )
-)
-if not defined CANDLE if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\candle.exe" set "CANDLE=%USERPROFILE%\scoop\apps\wixtoolset\current\bin\candle.exe"
-if not defined CANDLE (
-  for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do (
-    if exist "%%D\bin\candle.exe" (
-      set "CANDLE=%%D\bin\candle.exe"
-      goto :candle_found
-    )
-  )
-)
-if not defined CANDLE (
-  for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do (
-    if exist "%%D\bin\candle.exe" (
-      set "CANDLE=%%D\bin\candle.exe"
-      goto :candle_found
-    )
-  )
-)
-:candle_found
-where light >nul 2>&1
-if not errorlevel 1 (
-  for /f "delims=" %%P in ('where light') do (
-    set "LIGHT=%%P"
-    goto :light_found
-  )
-)
-if not defined LIGHT if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\light.exe" set "LIGHT=%USERPROFILE%\scoop\apps\wixtoolset\current\bin\light.exe"
-if not defined LIGHT (
-  for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do (
-    if exist "%%D\bin\light.exe" (
-      set "LIGHT=%%D\bin\light.exe"
-      goto :light_found
-    )
-  )
-)
-if not defined LIGHT (
-  for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do (
-    if exist "%%D\bin\light.exe" (
-      set "LIGHT=%%D\bin\light.exe"
-      goto :light_found
-    )
-  )
-)
-if defined CANDLE (
-  for %%P in ("!CANDLE!") do if exist "%%~dpPlight.exe" set "LIGHT=%%~dpPlight.exe"
-)
-:light_found
+call :find_candle
+call :find_light
 if not defined CANDLE (
   echo error: 'candle' (WiX Toolset v3) is required but not installed.
   echo install with:
@@ -151,10 +160,9 @@ if not defined LIGHT (
   echo   scoop install wixtoolset nsis
   exit /b 1
 )
-if not exist "target\release\%BIN_NAME%.exe" (
-  call :cmd_exe
-  if errorlevel 1 exit /b 1
-)
+call :ensure_release_bin
+if errorlevel 1 exit /b 1
+
 set "WIXOBJ=target\release\%BIN_NAME%.wixobj"
 set "MSI=target\release\%BIN_NAME%-%VERSION%-x64.msi"
 echo ==^> Building WiX MSI (v%VERSION%)...
@@ -169,13 +177,7 @@ exit /b 0
 call :cmd_exe
 if errorlevel 1 exit /b 1
 
-set "MAKENSIS="
-where makensis >nul 2>&1
-if not errorlevel 1 set "MAKENSIS=1"
-if not defined MAKENSIS if exist "%USERPROFILE%\scoop\shims\makensis.exe" set "MAKENSIS=1"
-if not defined MAKENSIS if exist "%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" set "MAKENSIS=1"
-if not defined MAKENSIS if exist "%ProgramFiles(x86)%\NSIS\makensis.exe" set "MAKENSIS=1"
-if not defined MAKENSIS if exist "%ProgramFiles%\NSIS\makensis.exe" set "MAKENSIS=1"
+call :find_makensis
 if defined MAKENSIS (
   call :cmd_nsis
   if errorlevel 1 exit /b 1
@@ -183,24 +185,9 @@ if defined MAKENSIS (
   echo ==^> Skipping NSIS (makensis not found)
 )
 
-set "HAS_WIX="
-where candle >nul 2>&1
-if not errorlevel 1 (
-  where light >nul 2>&1
-  if not errorlevel 1 set "HAS_WIX=1"
-)
-if not defined HAS_WIX if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\candle.exe" if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\light.exe" set "HAS_WIX=1"
-if not defined HAS_WIX (
-  for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do (
-    if exist "%%D\bin\candle.exe" if exist "%%D\bin\light.exe" set "HAS_WIX=1"
-  )
-)
-if not defined HAS_WIX (
-  for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do (
-    if exist "%%D\bin\candle.exe" if exist "%%D\bin\light.exe" set "HAS_WIX=1"
-  )
-)
-if defined HAS_WIX (
+call :find_candle
+call :find_light
+if defined CANDLE if defined LIGHT (
   call :cmd_wix
   if errorlevel 1 exit /b 1
 ) else (

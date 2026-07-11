@@ -37,6 +37,25 @@ require_cmd() {
     fi
 }
 
+release_bin() {
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) echo "target/release/${BIN_NAME}.exe" ;;
+        *) echo "target/release/${BIN_NAME}" ;;
+    esac
+}
+
+# Build release binary only if missing (CI should pre-build via cargo test --release).
+ensure_release_bin() {
+    local bin
+    bin="$(release_bin)"
+    if [ -f "$bin" ]; then
+        echo "==> Using existing $bin"
+        return 0
+    fi
+    echo "==> Building release binary..."
+    cargo build --release
+}
+
 # Resolve a Windows tool that may live under Program Files (Git Bash PATH often incomplete).
 find_win_cmd() {
     local name="$1"
@@ -52,7 +71,13 @@ find_win_cmd() {
         [A-Za-z]:*) home="/${home:0:1}${home:2}" ;;
     esac
 
+    # CI portable tools dir
+    local repo_root
+    repo_root="$(pwd)"
     for p in \
+        "$repo_root/tools/nsis-3.10/${name}.exe" \
+        "$repo_root/tools/nsis/${name}.exe" \
+        "$repo_root/tools/wix/${name}.exe" \
         "$home/scoop/shims/${name}.exe" \
         "$home/scoop/apps/nsis/current/${name}.exe" \
         "$home/scoop/apps/wixtoolset/current/bin/${name}.exe" \
@@ -79,12 +104,19 @@ find_win_cmd() {
         echo "$match"
         return 0
     fi
+    match="$(ls -d "$repo_root/tools/nsis-"*"/${name}.exe" 2>/dev/null | head -n1 || true)"
+    if [ -n "$match" ] && [ -f "$match" ]; then
+        echo "$match"
+        return 0
+    fi
     return 1
 }
 
 cmd_app_macos() {
     require_cmd cargo-bundle
+    ensure_release_bin
     echo "==> Building .app bundle..."
+    # cargo-bundle invokes cargo; after a prior release build this is incremental.
     cargo bundle --release
     echo "==> Done: target/release/bundle/osx/$BIN_NAME.app"
 }
@@ -110,8 +142,9 @@ cmd_dmg() {
 
 cmd_deb() {
     require_cmd cargo-deb
+    ensure_release_bin
     echo "==> Building .deb package..."
-    cargo deb
+    cargo deb --no-build
     echo "==> Done: target/debian/${BIN_NAME}_*.deb"
 }
 
@@ -122,10 +155,7 @@ cmd_appimage() {
     local binary="target/release/$BIN_NAME"
     local appimagetool="/tmp/appimagetool"
 
-    # Build binary if not already present
-    if [ ! -f "$binary" ]; then
-        cargo build --release
-    fi
+    ensure_release_bin
 
     # Create AppDir structure
     rm -rf "$appdir"
@@ -160,9 +190,8 @@ APPRUN
 }
 
 cmd_exe() {
-    echo "==> Building release exe (icon embedded via build.rs)..."
-    cargo build --release
-    echo "==> Done: target/release/$BIN_NAME.exe"
+    ensure_release_bin
+    echo "==> Done: $(release_bin)"
 }
 
 cmd_nsis() {
@@ -175,9 +204,7 @@ cmd_nsis() {
         exit 1
     fi
 
-    if [ ! -f "target/release/$BIN_NAME.exe" ]; then
-        cmd_exe
-    fi
+    ensure_release_bin
 
     echo "==> Building NSIS installer (v${VERSION})..."
     "$makensis" -DVERSION="$VERSION" packaging/windows/realraw.nsi
@@ -201,9 +228,7 @@ cmd_wix() {
         exit 1
     fi
 
-    if [ ! -f "target/release/$BIN_NAME.exe" ]; then
-        cmd_exe
-    fi
+    ensure_release_bin
 
     local wixobj="target/release/${BIN_NAME}.wixobj"
     local msi="target/release/${BIN_NAME}-${VERSION}-x64.msi"
@@ -232,9 +257,7 @@ cmd_all() {
             ;;
         Linux)
             cmd_deb
-            if command -v cargo-appimage &>/dev/null; then
-                cmd_appimage
-            fi
+            cmd_appimage
             ;;
         MINGW*|MSYS*|CYGWIN*)
             cmd_exe

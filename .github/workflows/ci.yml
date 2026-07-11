@@ -11,6 +11,7 @@ env:
 jobs:
   ci:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
@@ -27,43 +28,63 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Install packaging tools (macOS)
+      - name: Install cargo-bundle
         if: runner.os == 'macOS'
-        run: |
-          cargo install cargo-bundle
-          brew install create-dmg
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-bundle
 
-      - name: Install packaging tools (Linux)
+      - name: Install create-dmg
+        if: runner.os == 'macOS'
+        run: brew install create-dmg
+
+      - name: Install cargo-deb
         if: runner.os == 'Linux'
-        run: |
-          cargo install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
 
-      - name: Install packaging tools (Windows)
+      - name: Cache Windows packaging tools
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: tools
+          key: win-packaging-nsis-3.10-wix-3.14.1
+
+      - name: Install NSIS and WiX (portable)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install nsis wixtoolset -y --no-progress
-          # Refresh PATH for subsequent steps (chocolatey installs)
-          $machine = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-          $user = [System.Environment]::GetEnvironmentVariable("Path", "User")
-          echo "Path=$machine;$user" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $tools = Join-Path $env:GITHUB_WORKSPACE "tools"
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
 
-      - name: Build release binary
-        run: cargo build --release
+          $nsisDir = Join-Path $tools "nsis-3.10"
+          if (-not (Test-Path (Join-Path $nsisDir "makensis.exe"))) {
+            $nsisZip = Join-Path $tools "nsis-3.10.zip"
+            Write-Host "Downloading NSIS 3.10..."
+            Invoke-WebRequest -Uri "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.10/nsis-3.10.zip" -OutFile $nsisZip -UserAgent "Wget/1.21"
+            Expand-Archive -Path $nsisZip -DestinationPath $tools -Force
+            Remove-Item $nsisZip -Force -ErrorAction SilentlyContinue
+          }
 
-      - name: Run tests
+          $wixDir = Join-Path $tools "wix"
+          if (-not (Test-Path (Join-Path $wixDir "candle.exe"))) {
+            $wixZip = Join-Path $tools "wix314-binaries.zip"
+            Write-Host "Downloading WiX 3.14 binaries..."
+            Invoke-WebRequest -Uri "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip" -OutFile $wixZip
+            New-Item -ItemType Directory -Force -Path $wixDir | Out-Null
+            Expand-Archive -Path $wixZip -DestinationPath $wixDir -Force
+            Remove-Item $wixZip -Force -ErrorAction SilentlyContinue
+          }
+
+          Add-Content -Path $env:GITHUB_PATH -Value $nsisDir
+          Add-Content -Path $env:GITHUB_PATH -Value $wixDir
+
+      # Single release compile: builds lib, bins, and tests.
+      - name: Test (release)
         run: cargo test --release
 
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
-        run: ./scripts/package.sh all
-
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
-        run: ./scripts/package.sh all
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
+      - name: Package
         shell: bash
         run: ./scripts/package.sh all
 
@@ -72,6 +93,7 @@ jobs:
         with:
           name: realraw-${{ matrix.label }}
           path: |
+            target/release/realraw
             target/release/realraw.exe
             target/release/*-setup.exe
             target/release/*.msi
@@ -80,4 +102,5 @@ jobs:
             target/release/*.AppImage
             target/release/bundle/**/*.app
           compression-level: 0
+          retention-days: 7
           if-no-files-found: ignore
