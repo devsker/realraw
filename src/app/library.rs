@@ -271,7 +271,7 @@ impl LibraryPage {
     }
 
     /// Low-priority background refresh: rebuild the library thumbnail from
-    /// develop linear + exposure and swap it in when ready. Keeps the old
+    /// develop linear + tone and swap it in when ready. Keeps the old
     /// thumb visible until the new one arrives.
     pub fn schedule_developed_thumb_refresh(
         &self,
@@ -280,6 +280,7 @@ impl LibraryPage {
         source_path: PathBuf,
         orientation: Option<i64>,
         exposure: f32,
+        contrast: f32,
     ) {
         self.inflight_thumbs.fetch_add(1, Ordering::Relaxed);
         let tx = self.thumb_tx.clone();
@@ -295,6 +296,7 @@ impl LibraryPage {
                         &source_path,
                         orientation,
                         exposure,
+                        contrast,
                     )
                 }) {
                     Ok(r) => r,

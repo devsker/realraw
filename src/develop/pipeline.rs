@@ -1,9 +1,9 @@
-//! Linear RAW develop + exposure tone stage.
+//! Linear RAW develop + tone stage.
 //!
 //! Pipeline:
 //! 1. rawler demosaic + WB + cam→linear sRGB (no gamma)
 //! 2. Cache f32 RGB (`LinearPreview`)
-//! 3. Exposure: `L * 2^EV`, then sRGB OETF → Rgba8
+//! 3. Tone: exposure (`L * 2^EV`) → contrast (pivot S-scale) → sRGB OETF → Rgba8
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
@@ -169,29 +169,116 @@ fn intermediate_to_rgb_f32(
     }
 }
 
-/// Apply exposure in linear light, then sRGB OETF → 8-bit RGBA.
-///
-/// `max_dim` caps the longest edge (typically the on-screen preview size).
+/// Apply exposure only (contrast = 0). Prefer [`apply_tone`] when contrast is set.
 pub fn apply_exposure(linear: &LinearPreview, exposure_ev: f32, max_dim: u32) -> PreviewImage {
+    apply_tone(linear, exposure_ev, 0.0, max_dim)
+}
+
+/// Apply exposure + contrast in linear light, then sRGB OETF → 8-bit RGBA.
+///
+/// Order: `L * 2^EV` → Lightroom-style luminance contrast → clamp → OETF.
+/// `contrast` is Lightroom-style `-100..=100` (0 = identity).
+/// `max_dim` caps the longest edge (typically the on-screen preview size).
+pub fn apply_tone(
+    linear: &LinearPreview,
+    exposure_ev: f32,
+    contrast: f32,
+    max_dim: u32,
+) -> PreviewImage {
     let (src_w, src_h, src) = if linear.width <= max_dim && linear.height <= max_dim {
         (linear.width, linear.height, linear.rgb.as_slice())
     } else {
         // Nearest-neighbor proxy from the full linear buffer.
         let (w, h, buf) = downscale_rgb_nearest(&linear.rgb, linear.width, linear.height, max_dim);
-        return tone_to_preview(&buf, w, h, exposure_ev);
+        return tone_to_preview(&buf, w, h, exposure_ev, contrast);
     };
-    tone_to_preview(src, src_w, src_h, exposure_ev)
+    tone_to_preview(src, src_w, src_h, exposure_ev, contrast)
 }
 
-fn tone_to_preview(rgb: &[f32], width: u32, height: u32, exposure_ev: f32) -> PreviewImage {
+/// sRGB EOTF (encoded → linear). Inverse of [`srgb_apply_gamma`].
+#[inline]
+fn srgb_eotf(u: f32) -> f32 {
+    if u <= 0.04045 {
+        u / 12.92
+    } else {
+        ((u + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[inline]
+fn sigmoid(v: f32) -> f32 {
+    1.0 / (1.0 + (-v).exp())
+}
+
+/// Normalized sigmoid S-curve on `[0, 1]`: fixes black/white, holds mid-gray.
+/// `k > 0` steeper midtones (more contrast). Unlike a linear pivot, endpoints
+/// stay put so overall brightness does not collapse on dark frames.
+#[inline]
+fn s_curve(x: f32, k: f32) -> f32 {
+    let a = sigmoid(k * (x - 0.5));
+    let a0 = sigmoid(k * -0.5);
+    let a1 = sigmoid(k * 0.5);
+    ((a - a0) / (a1 - a0)).clamp(0.0, 1.0)
+}
+
+/// Lightroom-like contrast curve in sRGB-encoded luminance (`t` = slider/100).
+///
+/// - Positive: S-curve (fixed 0/1, mid-gray stable) — punch without global darkening
+/// - Negative: mild linear flatten toward mid-gray — no gray fog
+#[inline]
+fn contrast_curve(x: f32, t: f32) -> f32 {
+    if t >= 0.0 {
+        // k: 1 ≈ gentle, ~3.2 at +100 ≈ LR Contrast2012 punch
+        let k = 1.0 + 2.2 * t;
+        // Blend identity → S-curve so low amounts stay subtle
+        let s = s_curve(x, k);
+        x + t * (s - x)
+    } else {
+        let slope = 1.0 + 0.45 * t; // −100 → 0.55×
+        (0.5 + (x - 0.5) * slope).clamp(0.0, 1.0)
+    }
+}
+
+/// Lightroom-like contrast on linear RGB: curve luminance in sRGB space,
+/// rescale channels to preserve chromaticity (avoids gray wash at −100).
+#[inline]
+fn apply_contrast_rgb(r: f32, g: f32, b: f32, contrast: f32) -> [f32; 3] {
+    if contrast.abs() < 1e-6 {
+        return [r, g, b];
+    }
+    // Rec.709 linear luminance
+    let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175_0 * b;
+    if y <= 1e-10 {
+        return [r.max(0.0), g.max(0.0), b.max(0.0)];
+    }
+
+    let ye = srgb_apply_gamma(y.clamp(0.0, 1.0));
+    let t = (contrast / 100.0).clamp(-1.0, 1.0);
+    let ye2 = contrast_curve(ye, t);
+    let y2 = srgb_eotf(ye2);
+    let scale = y2 / y;
+    [(r * scale).max(0.0), (g * scale).max(0.0), (b * scale).max(0.0)]
+}
+
+fn tone_to_preview(
+    rgb: &[f32],
+    width: u32,
+    height: u32,
+    exposure_ev: f32,
+    contrast: f32,
+) -> PreviewImage {
     let gain = 2f32.powf(exposure_ev);
     let n = width as usize * height as usize;
     let mut rgba = Vec::with_capacity(n * 4);
     for i in 0..n {
         let base = i * 3;
-        let r = srgb_apply_gamma((rgb[base] * gain).clamp(0.0, 1.0));
-        let g = srgb_apply_gamma((rgb[base + 1] * gain).clamp(0.0, 1.0));
-        let b = srgb_apply_gamma((rgb[base + 2] * gain).clamp(0.0, 1.0));
+        let rl = rgb[base] * gain;
+        let gl = rgb[base + 1] * gain;
+        let bl = rgb[base + 2] * gain;
+        let [rl, gl, bl] = apply_contrast_rgb(rl, gl, bl, contrast);
+        let r = srgb_apply_gamma(rl.clamp(0.0, 1.0));
+        let g = srgb_apply_gamma(gl.clamp(0.0, 1.0));
+        let b = srgb_apply_gamma(bl.clamp(0.0, 1.0));
         rgba.push((r * 255.0 + 0.5) as u8);
         rgba.push((g * 255.0 + 0.5) as u8);
         rgba.push((b * 255.0 + 0.5) as u8);
@@ -431,5 +518,105 @@ mod tests {
         let img = apply_exposure(&lin, 0.0, 800);
         assert!(img.width <= 800);
         assert!(img.height <= 800);
+    }
+
+    #[test]
+    fn contrast_zero_matches_exposure_only() {
+        let lin = solid(4, 4, 0.25);
+        let a = apply_exposure(&lin, 0.5, 4);
+        let b = apply_tone(&lin, 0.5, 0.0, 4);
+        assert_eq!(a.rgba, b.rgba);
+    }
+
+    #[test]
+    fn positive_contrast_spreads_from_pivot() {
+        // Below mid-gray: darkens; above: brightens.
+        let dark = solid(2, 2, 0.05);
+        let bright = solid(2, 2, 0.5);
+        let d0 = apply_tone(&dark, 0.0, 0.0, 2);
+        let d1 = apply_tone(&dark, 0.0, 80.0, 2);
+        let b0 = apply_tone(&bright, 0.0, 0.0, 2);
+        let b1 = apply_tone(&bright, 0.0, 80.0, 2);
+        assert!(d1.rgba[0] < d0.rgba[0], "dark should darken: {} vs {}", d1.rgba[0], d0.rgba[0]);
+        assert!(b1.rgba[0] > b0.rgba[0], "bright should brighten: {} vs {}", b1.rgba[0], b0.rgba[0]);
+    }
+
+    #[test]
+    fn negative_contrast_compresses_toward_pivot() {
+        let dark = solid(2, 2, 0.05);
+        let bright = solid(2, 2, 0.5);
+        let d0 = apply_tone(&dark, 0.0, 0.0, 2);
+        let d1 = apply_tone(&dark, 0.0, -80.0, 2);
+        let b0 = apply_tone(&bright, 0.0, 0.0, 2);
+        let b1 = apply_tone(&bright, 0.0, -80.0, 2);
+        assert!(d1.rgba[0] > d0.rgba[0], "dark should lift: {} vs {}", d1.rgba[0], d0.rgba[0]);
+        assert!(b1.rgba[0] < b0.rgba[0], "bright should drop: {} vs {}", b1.rgba[0], b0.rgba[0]);
+    }
+
+    #[test]
+    fn pivot_gray_stable_under_contrast() {
+        // Linear value of sRGB mid-gray (OETF⁻¹(0.5)).
+        let lin = solid(2, 2, 0.214_041_14);
+        let a = apply_tone(&lin, 0.0, 0.0, 2);
+        let b = apply_tone(&lin, 0.0, 100.0, 2);
+        let c = apply_tone(&lin, 0.0, -100.0, 2);
+        assert_eq!(a.rgba[0], b.rgba[0]);
+        assert_eq!(a.rgba[0], c.rgba[0]);
+    }
+
+    #[test]
+    fn negative_contrast_preserves_chromaticity() {
+        // Warm pixel: must not collapse toward neutral gray.
+        let lin = LinearPreview {
+            width: 1,
+            height: 1,
+            rgb: vec![0.6, 0.25, 0.08],
+        };
+        let img = apply_tone(&lin, 0.0, -100.0, 1);
+        let r = img.rgba[0] as i16;
+        let g = img.rgba[1] as i16;
+        let b = img.rgba[2] as i16;
+        assert!(r > g + 20, "should stay warm: r={r} g={g} b={b}");
+        assert!(g > b, "should stay warm: r={r} g={g} b={b}");
+        // Must not wash to mid-gray fog (~128,128,128).
+        let mean = (r + g + b) / 3;
+        assert!(
+            (r - mean).abs() > 15 || (g - mean).abs() > 15,
+            "too neutral: r={r} g={g} b={b}"
+        );
+    }
+
+    #[test]
+    fn negative_contrast_keeps_shadow_depth() {
+        // At −100, deep shadows must not lift to mid-gray.
+        let dark = solid(2, 2, 0.02);
+        let img = apply_tone(&dark, 0.0, -100.0, 2);
+        assert!(
+            img.rgba[0] < 90,
+            "shadows washed out: got {}",
+            img.rgba[0]
+        );
+    }
+
+    #[test]
+    fn positive_contrast_does_not_crush_shadows() {
+        // Linear mid-pivot with high slope crushed dark frames; S-curve must not.
+        let dark = solid(2, 2, 0.08);
+        let base = apply_tone(&dark, 0.0, 0.0, 2);
+        let punch = apply_tone(&dark, 0.0, 100.0, 2);
+        // May darken a little, but must stay well above near-black.
+        assert!(
+            punch.rgba[0] > 30,
+            "shadows crushed: base={} punch={}",
+            base.rgba[0],
+            punch.rgba[0]
+        );
+        // And not a large global collapse (e.g. half the tone).
+        assert!(
+            punch.rgba[0] as i16 > base.rgba[0] as i16 / 2,
+            "too dark overall: base={} punch={}",
+            base.rgba[0],
+            punch.rgba[0]
+        );
     }
 }

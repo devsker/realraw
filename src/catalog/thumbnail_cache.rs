@@ -135,12 +135,12 @@ pub fn get_or_generate(
     })
 }
 
-/// Rebuild the library thumbnail from the develop linear buffer + exposure.
+/// Rebuild the library thumbnail from the develop linear buffer + tone.
 ///
 /// Prefers the on-disk linear demosaic cache (no rawler). Falls back to a
 /// full linear develop if the cache is cold. Always overwrites the JPEG
 /// thumbnail on disk. Also refreshes the develop sRGB preview cache so
-/// reopening the photo does not flash a stale EV=0 image.
+/// reopening the photo does not flash a stale identity-tone image.
 /// Intended for low-priority post-edit refresh.
 pub fn regenerate_from_develop(
     catalog_dir: &Path,
@@ -148,9 +148,10 @@ pub fn regenerate_from_develop(
     source_path: &Path,
     orientation: Option<i64>,
     exposure: f32,
+    contrast: f32,
 ) -> Result<ThumbnailBytes, String> {
     use crate::catalog::preview_cache;
-    use crate::develop::{apply_exposure, develop_linear, PreviewImage, PreviewSource, PREVIEW_MAX_DIM};
+    use crate::develop::{apply_tone, develop_linear, PreviewImage, PreviewSource, PREVIEW_MAX_DIM};
 
     let linear = if let Some(lin) =
         preview_cache::load_linear(catalog_dir, photo_id, orientation)
@@ -163,7 +164,7 @@ pub fn regenerate_from_develop(
         lin
     };
 
-    let img = apply_exposure(&linear, exposure, CACHE_MAX_DIM);
+    let img = apply_tone(&linear, exposure, contrast, CACHE_MAX_DIM);
     let thumb = Thumbnail {
         width: img.width,
         height: img.height,
@@ -172,9 +173,9 @@ pub fn regenerate_from_develop(
     };
     save_thumbnail(catalog_dir, photo_id, &thumb).map_err(|e| e.to_string())?;
 
-    // Keep develop placeholder cache in sync with current exposure so a
-    // later open does not prefer a stale EV=0 demosaic JPEG.
-    let preview = apply_exposure(&linear, exposure, PREVIEW_MAX_DIM);
+    // Keep develop placeholder cache in sync with current tone so a
+    // later open does not prefer a stale identity demosaic JPEG.
+    let preview = apply_tone(&linear, exposure, contrast, PREVIEW_MAX_DIM);
     let _ = preview_cache::save_preview(
         catalog_dir,
         photo_id,

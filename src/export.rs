@@ -2,19 +2,20 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::develop::{apply_exposure, develop_linear, PreviewImage};
+use crate::develop::{apply_tone, develop_linear, PreviewImage};
 use crate::task::{Task, TaskContext, TaskId, TaskManager};
 
 /// JPEG quality for exported files.
 const EXPORT_JPEG_QUALITY: u8 = 92;
 
-/// Spawn a background task that develops `source` with `exposure` EV and
+/// Spawn a background task that develops `source` with tone params and
 /// writes the result to `dest` (format from extension: `.png` or JPEG).
 pub fn spawn_export_task(
     mgr: &mut TaskManager,
     source: PathBuf,
     orientation: Option<i64>,
     exposure: f32,
+    contrast: f32,
     dest: PathBuf,
 ) -> TaskId {
     let label = dest
@@ -37,9 +38,9 @@ pub fn spawn_export_task(
                 return Err("cancelled".into());
             }
             ctx.set_progress(0.65);
-            ctx.set_message("Applying exposure…");
+            ctx.set_message("Applying tone…");
 
-            let img = apply_exposure(&linear, exposure, u32::MAX);
+            let img = apply_tone(&linear, exposure, contrast, u32::MAX);
             if ctx.is_cancelled() {
                 return Err("cancelled".into());
             }

@@ -178,7 +178,7 @@ pub(crate) fn try_new_catalog(app: &mut App, path: &Path) {
     }
 }
 
-/// File → Export… : develop current photo with current exposure, save JPEG/PNG.
+/// File → Export… : develop current photo with current tone, save JPEG/PNG.
 fn export_current_photo(app: &mut App) {
     let Some(id) = app.develop_photo_id else {
         app.toasts
@@ -221,6 +221,7 @@ fn export_current_photo(app: &mut App) {
         PathBuf::from(&photo.path),
         photo.orientation,
         app.develop.exposure,
+        app.develop.contrast,
         dest,
     );
     app.toasts.add("Export started");

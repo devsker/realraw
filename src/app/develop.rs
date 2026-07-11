@@ -57,12 +57,12 @@ fn fire_thumb_refresh(app: &mut App, photo_id: i64) {
     let Ok(Some(photo)) = cat.find_photo_by_id(photo_id) else {
         return;
     };
-    let exposure = if app.develop_loaded_id == Some(photo_id) {
-        app.develop.exposure
+    let (exposure, contrast) = if app.develop_loaded_id == Some(photo_id) {
+        (app.develop.exposure, app.develop.contrast)
     } else {
         cat.get_develop(photo_id)
-            .map(|s| s.exposure)
-            .unwrap_or(0.0)
+            .map(|s| (s.exposure, s.contrast))
+            .unwrap_or((0.0, 0.0))
     };
     app.library.schedule_developed_thumb_refresh(
         cat.dir().to_path_buf(),
@@ -70,6 +70,7 @@ fn fire_thumb_refresh(app: &mut App, photo_id: i64) {
         PathBuf::from(&photo.path),
         photo.orientation,
         exposure,
+        contrast,
     );
 }
 
@@ -194,6 +195,7 @@ fn ensure_preview(app: &mut App) {
                 photo.orientation,
                 catalog_dir,
                 app.develop.exposure,
+                app.develop.contrast,
             );
         }
         Ok(None) => {
@@ -229,15 +231,25 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                     let hit = slider_row(ui, "Exposure", &mut app.develop.exposure, -5.0..=5.0);
                     if hit.changed {
                         any = true;
-                        app.develop_preview
-                            .set_exposure(app.develop.exposure, hit.dragging);
+                        app.develop_preview.set_tone(
+                            app.develop.exposure,
+                            app.develop.contrast,
+                            hit.dragging,
+                        );
                     }
                     dragging |= hit.dragging;
                 }
                 {
-                    let h = slider_row(ui, "Contrast", &mut app.develop.contrast, -100.0..=100.0);
-                    any |= h.changed;
-                    dragging |= h.dragging;
+                    let hit = slider_row(ui, "Contrast", &mut app.develop.contrast, -100.0..=100.0);
+                    if hit.changed {
+                        any = true;
+                        app.develop_preview.set_tone(
+                            app.develop.exposure,
+                            app.develop.contrast,
+                            hit.dragging,
+                        );
+                    }
+                    dragging |= hit.dragging;
                 }
                 {
                     let h = slider_row(ui, "Highlights", &mut app.develop.highlights, -100.0..=100.0);
@@ -302,8 +314,11 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                     app.develop = DevelopSettings::default();
                     app.develop_dirty = true;
                     app.develop_dragging = false;
-                    app.develop_preview
-                        .set_exposure(app.develop.exposure, false);
+                    app.develop_preview.set_tone(
+                        app.develop.exposure,
+                        app.develop.contrast,
+                        false,
+                    );
                     schedule_thumb_refresh(app);
                 }
             });
