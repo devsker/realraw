@@ -220,8 +220,7 @@ fn export_current_photo(app: &mut App) {
         &mut app.task_manager,
         PathBuf::from(&photo.path),
         photo.orientation,
-        app.develop.exposure,
-        app.develop.contrast,
+        app.develop.tone(),
         dest,
     );
     app.toasts.add("Export started");

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::develop::{apply_tone, develop_linear, PreviewImage};
+use crate::develop::{apply_tone, develop_linear, PreviewImage, ToneParams};
 use crate::task::{Task, TaskContext, TaskId, TaskManager};
 
 /// JPEG quality for exported files.
@@ -14,8 +14,7 @@ pub fn spawn_export_task(
     mgr: &mut TaskManager,
     source: PathBuf,
     orientation: Option<i64>,
-    exposure: f32,
-    contrast: f32,
+    tone: ToneParams,
     dest: PathBuf,
 ) -> TaskId {
     let label = dest
@@ -40,7 +39,7 @@ pub fn spawn_export_task(
             ctx.set_progress(0.65);
             ctx.set_message("Applying tone…");
 
-            let img = apply_tone(&linear, exposure, contrast, u32::MAX);
+            let img = apply_tone(&linear, &tone, u32::MAX);
             if ctx.is_cancelled() {
                 return Err("cancelled".into());
             }

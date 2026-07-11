@@ -10,4 +10,4 @@ pub use pipeline::{
     apply_exposure, apply_tone, develop_linear, develop_linear_with_progress, LinearPreview,
 };
 pub use preview::DevelopPreview;
-pub use settings::DevelopSettings;
+pub use settings::{DevelopSettings, ToneParams};

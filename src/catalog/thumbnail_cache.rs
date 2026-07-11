@@ -147,8 +147,7 @@ pub fn regenerate_from_develop(
     photo_id: i64,
     source_path: &Path,
     orientation: Option<i64>,
-    exposure: f32,
-    contrast: f32,
+    tone: crate::develop::ToneParams,
 ) -> Result<ThumbnailBytes, String> {
     use crate::catalog::preview_cache;
     use crate::develop::{apply_tone, develop_linear, PreviewImage, PreviewSource, PREVIEW_MAX_DIM};
@@ -164,7 +163,7 @@ pub fn regenerate_from_develop(
         lin
     };
 
-    let img = apply_tone(&linear, exposure, contrast, CACHE_MAX_DIM);
+    let img = apply_tone(&linear, &tone, CACHE_MAX_DIM);
     let thumb = Thumbnail {
         width: img.width,
         height: img.height,
@@ -175,7 +174,7 @@ pub fn regenerate_from_develop(
 
     // Keep develop placeholder cache in sync with current tone so a
     // later open does not prefer a stale identity demosaic JPEG.
-    let preview = apply_tone(&linear, exposure, contrast, PREVIEW_MAX_DIM);
+    let preview = apply_tone(&linear, &tone, PREVIEW_MAX_DIM);
     let _ = preview_cache::save_preview(
         catalog_dir,
         photo_id,

@@ -3,7 +3,7 @@
 //! Pipeline:
 //! 1. rawler demosaic + WB + cam→linear sRGB (no gamma)
 //! 2. Cache f32 RGB (`LinearPreview`)
-//! 3. Tone: exposure (`L * 2^EV`) → contrast (pivot S-scale) → sRGB OETF → Rgba8
+//! 3. Tone: exposure → contrast → H/S/W/B → sRGB OETF → Rgba8
 
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
@@ -12,6 +12,7 @@ use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::srgb::srgb_apply_gamma;
 
 use super::decode::{DecodeError, PreviewImage, PreviewSource};
+use super::settings::ToneParams;
 
 /// Linear (pre-gamma) develop buffer for interactive tone ops.
 #[derive(Debug, Clone)]
@@ -169,30 +170,24 @@ fn intermediate_to_rgb_f32(
     }
 }
 
-/// Apply exposure only (contrast = 0). Prefer [`apply_tone`] when contrast is set.
+/// Apply exposure only. Prefer [`apply_tone`] when other light sliders are set.
 pub fn apply_exposure(linear: &LinearPreview, exposure_ev: f32, max_dim: u32) -> PreviewImage {
-    apply_tone(linear, exposure_ev, 0.0, max_dim)
+    apply_tone(linear, &ToneParams::exposure_only(exposure_ev), max_dim)
 }
 
-/// Apply exposure + contrast in linear light, then sRGB OETF → 8-bit RGBA.
+/// Apply light-panel tone in linear light, then sRGB OETF → 8-bit RGBA.
 ///
-/// Order: `L * 2^EV` → Lightroom-style luminance contrast → clamp → OETF.
-/// `contrast` is Lightroom-style `-100..=100` (0 = identity).
+/// Order: `L * 2^EV` → contrast → highlights/shadows → whites/blacks → clamp → OETF.
 /// `max_dim` caps the longest edge (typically the on-screen preview size).
-pub fn apply_tone(
-    linear: &LinearPreview,
-    exposure_ev: f32,
-    contrast: f32,
-    max_dim: u32,
-) -> PreviewImage {
+pub fn apply_tone(linear: &LinearPreview, tone: &ToneParams, max_dim: u32) -> PreviewImage {
     let (src_w, src_h, src) = if linear.width <= max_dim && linear.height <= max_dim {
         (linear.width, linear.height, linear.rgb.as_slice())
     } else {
         // Nearest-neighbor proxy from the full linear buffer.
         let (w, h, buf) = downscale_rgb_nearest(&linear.rgb, linear.width, linear.height, max_dim);
-        return tone_to_preview(&buf, w, h, exposure_ev, contrast);
+        return tone_to_preview(&buf, w, h, tone);
     };
-    tone_to_preview(src, src_w, src_h, exposure_ev, contrast)
+    tone_to_preview(src, src_w, src_h, tone)
 }
 
 /// sRGB EOTF (encoded → linear). Inverse of [`srgb_apply_gamma`].
@@ -221,16 +216,15 @@ fn s_curve(x: f32, k: f32) -> f32 {
     ((a - a0) / (a1 - a0)).clamp(0.0, 1.0)
 }
 
-/// Lightroom-like contrast curve in sRGB-encoded luminance (`t` = slider/100).
+/// Contrast curve in sRGB-encoded luminance (`t` = slider/100).
 ///
 /// - Positive: S-curve (fixed 0/1, mid-gray stable) — punch without global darkening
 /// - Negative: mild linear flatten toward mid-gray — no gray fog
 #[inline]
 fn contrast_curve(x: f32, t: f32) -> f32 {
     if t >= 0.0 {
-        // k: 1 ≈ gentle, ~3.2 at +100 ≈ LR Contrast2012 punch
+        // k: 1 ≈ gentle, ~3.2 at +100
         let k = 1.0 + 2.2 * t;
-        // Blend identity → S-curve so low amounts stay subtle
         let s = s_curve(x, k);
         x + t * (s - x)
     } else {
@@ -239,11 +233,61 @@ fn contrast_curve(x: f32, t: f32) -> f32 {
     }
 }
 
-/// Lightroom-like contrast on linear RGB: curve luminance in sRGB space,
-/// rescale channels to preserve chromaticity (avoids gray wash at −100).
+/// Soft weight for the lower end of the tone scale (shadows / blacks).
 #[inline]
-fn apply_contrast_rgb(r: f32, g: f32, b: f32, contrast: f32) -> [f32; 3] {
-    if contrast.abs() < 1e-6 {
+fn low_mask(x: f32, power: f32) -> f32 {
+    (1.0 - x).clamp(0.0, 1.0).powf(power)
+}
+
+/// Soft weight for the upper end of the tone scale (highlights / whites).
+#[inline]
+fn high_mask(x: f32, power: f32) -> f32 {
+    x.clamp(0.0, 1.0).powf(power)
+}
+
+/// Highlights / shadows / whites / blacks on sRGB-encoded luminance (`-100..=100`).
+///
+/// Regional masks: shadows/highlights are broader; blacks/whites hug the ends.
+/// Positive shadows/blacks lift darks; positive highlights/whites lift brights.
+/// Negative signs reverse (recover highlights, deepen shadows, etc.).
+#[inline]
+fn region_curve(x: f32, highlights: f32, shadows: f32, whites: f32, blacks: f32) -> f32 {
+    let h = (highlights / 100.0).clamp(-1.0, 1.0);
+    let s = (shadows / 100.0).clamp(-1.0, 1.0);
+    let w = (whites / 100.0).clamp(-1.0, 1.0);
+    let b = (blacks / 100.0).clamp(-1.0, 1.0);
+    if h.abs() < 1e-6 && s.abs() < 1e-6 && w.abs() < 1e-6 && b.abs() < 1e-6 {
+        return x;
+    }
+
+    let mut y = x;
+    // Shadows first (broad dark lift/crush), then highlights.
+    if s.abs() > 1e-6 {
+        y = (y + s * 0.42 * low_mask(y, 2.0)).clamp(0.0, 1.0);
+    }
+    if h.abs() > 1e-6 {
+        y = (y + h * 0.42 * high_mask(y, 2.0)).clamp(0.0, 1.0);
+    }
+    // Endpoint controls: narrower masks than H/S.
+    if b.abs() > 1e-6 {
+        y = (y + b * 0.32 * low_mask(y, 3.0)).clamp(0.0, 1.0);
+    }
+    if w.abs() > 1e-6 {
+        y = (y + w * 0.32 * high_mask(y, 3.0)).clamp(0.0, 1.0);
+    }
+    y
+}
+
+/// Full light tone on linear RGB: luminance curves in sRGB space, rescale
+/// channels to preserve chromaticity.
+#[inline]
+fn apply_tone_rgb(r: f32, g: f32, b: f32, tone: &ToneParams) -> [f32; 3] {
+    let needs_curve = tone.contrast.abs() > 1e-6
+        || tone.highlights.abs() > 1e-6
+        || tone.shadows.abs() > 1e-6
+        || tone.whites.abs() > 1e-6
+        || tone.blacks.abs() > 1e-6;
+    if !needs_curve {
         return [r, g, b];
     }
     // Rec.709 linear luminance
@@ -252,22 +296,19 @@ fn apply_contrast_rgb(r: f32, g: f32, b: f32, contrast: f32) -> [f32; 3] {
         return [r.max(0.0), g.max(0.0), b.max(0.0)];
     }
 
-    let ye = srgb_apply_gamma(y.clamp(0.0, 1.0));
-    let t = (contrast / 100.0).clamp(-1.0, 1.0);
-    let ye2 = contrast_curve(ye, t);
-    let y2 = srgb_eotf(ye2);
+    let mut ye = srgb_apply_gamma(y.clamp(0.0, 1.0));
+    let ct = (tone.contrast / 100.0).clamp(-1.0, 1.0);
+    if ct.abs() > 1e-6 {
+        ye = contrast_curve(ye, ct);
+    }
+    ye = region_curve(ye, tone.highlights, tone.shadows, tone.whites, tone.blacks);
+    let y2 = srgb_eotf(ye);
     let scale = y2 / y;
     [(r * scale).max(0.0), (g * scale).max(0.0), (b * scale).max(0.0)]
 }
 
-fn tone_to_preview(
-    rgb: &[f32],
-    width: u32,
-    height: u32,
-    exposure_ev: f32,
-    contrast: f32,
-) -> PreviewImage {
-    let gain = 2f32.powf(exposure_ev);
+fn tone_to_preview(rgb: &[f32], width: u32, height: u32, tone: &ToneParams) -> PreviewImage {
+    let gain = 2f32.powf(tone.exposure);
     let n = width as usize * height as usize;
     let mut rgba = Vec::with_capacity(n * 4);
     for i in 0..n {
@@ -275,7 +316,7 @@ fn tone_to_preview(
         let rl = rgb[base] * gain;
         let gl = rgb[base + 1] * gain;
         let bl = rgb[base + 2] * gain;
-        let [rl, gl, bl] = apply_contrast_rgb(rl, gl, bl, contrast);
+        let [rl, gl, bl] = apply_tone_rgb(rl, gl, bl, tone);
         let r = srgb_apply_gamma(rl.clamp(0.0, 1.0));
         let g = srgb_apply_gamma(gl.clamp(0.0, 1.0));
         let b = srgb_apply_gamma(bl.clamp(0.0, 1.0));
@@ -485,6 +526,7 @@ fn downscale_rgb_nearest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::develop::ToneParams;
 
     fn solid(w: u32, h: u32, v: f32) -> LinearPreview {
         LinearPreview {
@@ -520,11 +562,24 @@ mod tests {
         assert!(img.height <= 800);
     }
 
+    fn tone_contrast(c: f32) -> ToneParams {
+        ToneParams {
+            contrast: c,
+            ..ToneParams::default()
+        }
+    }
+
+    fn tone_with(mut f: impl FnMut(&mut ToneParams)) -> ToneParams {
+        let mut t = ToneParams::default();
+        f(&mut t);
+        t
+    }
+
     #[test]
     fn contrast_zero_matches_exposure_only() {
         let lin = solid(4, 4, 0.25);
         let a = apply_exposure(&lin, 0.5, 4);
-        let b = apply_tone(&lin, 0.5, 0.0, 4);
+        let b = apply_tone(&lin, &ToneParams::exposure_only(0.5), 4);
         assert_eq!(a.rgba, b.rgba);
     }
 
@@ -533,10 +588,10 @@ mod tests {
         // Below mid-gray: darkens; above: brightens.
         let dark = solid(2, 2, 0.05);
         let bright = solid(2, 2, 0.5);
-        let d0 = apply_tone(&dark, 0.0, 0.0, 2);
-        let d1 = apply_tone(&dark, 0.0, 80.0, 2);
-        let b0 = apply_tone(&bright, 0.0, 0.0, 2);
-        let b1 = apply_tone(&bright, 0.0, 80.0, 2);
+        let d0 = apply_tone(&dark, &ToneParams::default(), 2);
+        let d1 = apply_tone(&dark, &tone_contrast(80.0), 2);
+        let b0 = apply_tone(&bright, &ToneParams::default(), 2);
+        let b1 = apply_tone(&bright, &tone_contrast(80.0), 2);
         assert!(d1.rgba[0] < d0.rgba[0], "dark should darken: {} vs {}", d1.rgba[0], d0.rgba[0]);
         assert!(b1.rgba[0] > b0.rgba[0], "bright should brighten: {} vs {}", b1.rgba[0], b0.rgba[0]);
     }
@@ -545,10 +600,10 @@ mod tests {
     fn negative_contrast_compresses_toward_pivot() {
         let dark = solid(2, 2, 0.05);
         let bright = solid(2, 2, 0.5);
-        let d0 = apply_tone(&dark, 0.0, 0.0, 2);
-        let d1 = apply_tone(&dark, 0.0, -80.0, 2);
-        let b0 = apply_tone(&bright, 0.0, 0.0, 2);
-        let b1 = apply_tone(&bright, 0.0, -80.0, 2);
+        let d0 = apply_tone(&dark, &ToneParams::default(), 2);
+        let d1 = apply_tone(&dark, &tone_contrast(-80.0), 2);
+        let b0 = apply_tone(&bright, &ToneParams::default(), 2);
+        let b1 = apply_tone(&bright, &tone_contrast(-80.0), 2);
         assert!(d1.rgba[0] > d0.rgba[0], "dark should lift: {} vs {}", d1.rgba[0], d0.rgba[0]);
         assert!(b1.rgba[0] < b0.rgba[0], "bright should drop: {} vs {}", b1.rgba[0], b0.rgba[0]);
     }
@@ -557,9 +612,9 @@ mod tests {
     fn pivot_gray_stable_under_contrast() {
         // Linear value of sRGB mid-gray (OETF⁻¹(0.5)).
         let lin = solid(2, 2, 0.214_041_14);
-        let a = apply_tone(&lin, 0.0, 0.0, 2);
-        let b = apply_tone(&lin, 0.0, 100.0, 2);
-        let c = apply_tone(&lin, 0.0, -100.0, 2);
+        let a = apply_tone(&lin, &ToneParams::default(), 2);
+        let b = apply_tone(&lin, &tone_contrast(100.0), 2);
+        let c = apply_tone(&lin, &tone_contrast(-100.0), 2);
         assert_eq!(a.rgba[0], b.rgba[0]);
         assert_eq!(a.rgba[0], c.rgba[0]);
     }
@@ -572,7 +627,7 @@ mod tests {
             height: 1,
             rgb: vec![0.6, 0.25, 0.08],
         };
-        let img = apply_tone(&lin, 0.0, -100.0, 1);
+        let img = apply_tone(&lin, &tone_contrast(-100.0), 1);
         let r = img.rgba[0] as i16;
         let g = img.rgba[1] as i16;
         let b = img.rgba[2] as i16;
@@ -590,7 +645,7 @@ mod tests {
     fn negative_contrast_keeps_shadow_depth() {
         // At −100, deep shadows must not lift to mid-gray.
         let dark = solid(2, 2, 0.02);
-        let img = apply_tone(&dark, 0.0, -100.0, 2);
+        let img = apply_tone(&dark, &tone_contrast(-100.0), 2);
         assert!(
             img.rgba[0] < 90,
             "shadows washed out: got {}",
@@ -602,8 +657,8 @@ mod tests {
     fn positive_contrast_does_not_crush_shadows() {
         // Linear mid-pivot with high slope crushed dark frames; S-curve must not.
         let dark = solid(2, 2, 0.08);
-        let base = apply_tone(&dark, 0.0, 0.0, 2);
-        let punch = apply_tone(&dark, 0.0, 100.0, 2);
+        let base = apply_tone(&dark, &ToneParams::default(), 2);
+        let punch = apply_tone(&dark, &tone_contrast(100.0), 2);
         // May darken a little, but must stay well above near-black.
         assert!(
             punch.rgba[0] > 30,
@@ -619,4 +674,41 @@ mod tests {
             punch.rgba[0]
         );
     }
+
+    #[test]
+    fn positive_shadows_lift_darks() {
+        let dark = solid(2, 2, 0.04);
+        let base = apply_tone(&dark, &ToneParams::default(), 2);
+        let lifted = apply_tone(
+            &dark,
+            &tone_with(|t| t.shadows = 80.0),
+            2,
+        );
+        assert!(lifted.rgba[0] > base.rgba[0]);
+    }
+
+    #[test]
+    fn negative_highlights_darken_brights() {
+        let bright = solid(2, 2, 0.7);
+        let base = apply_tone(&bright, &ToneParams::default(), 2);
+        let recovered = apply_tone(
+            &bright,
+            &tone_with(|t| t.highlights = -80.0),
+            2,
+        );
+        assert!(recovered.rgba[0] < base.rgba[0]);
+    }
+
+    #[test]
+    fn whites_and_blacks_move_endpoints() {
+        let dark = solid(2, 2, 0.03);
+        let bright = solid(2, 2, 0.75);
+        let d0 = apply_tone(&dark, &ToneParams::default(), 2);
+        let d1 = apply_tone(&dark, &tone_with(|t| t.blacks = 80.0), 2);
+        let b0 = apply_tone(&bright, &ToneParams::default(), 2);
+        let b1 = apply_tone(&bright, &tone_with(|t| t.whites = -80.0), 2);
+        assert!(d1.rgba[0] > d0.rgba[0], "blacks+ should lift darks");
+        assert!(b1.rgba[0] < b0.rgba[0], "whites- should drop brights");
+    }
+
 }

@@ -279,8 +279,7 @@ impl LibraryPage {
         photo_id: i64,
         source_path: PathBuf,
         orientation: Option<i64>,
-        exposure: f32,
-        contrast: f32,
+        tone: crate::develop::ToneParams,
     ) {
         self.inflight_thumbs.fetch_add(1, Ordering::Relaxed);
         let tx = self.thumb_tx.clone();
@@ -295,8 +294,7 @@ impl LibraryPage {
                         photo_id,
                         &source_path,
                         orientation,
-                        exposure,
-                        contrast,
+                        tone,
                     )
                 }) {
                     Ok(r) => r,

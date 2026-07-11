@@ -4,7 +4,7 @@
 //! 1. Placeholder (disk sRGB JPEG cache / library thumb / embedded JPEG)
 //! 2. Linear demosaic → [`LinearPreview`]: load from disk linear cache if
 //!    present, otherwise rawler demosaic + write cache
-//! 3. Tone (exposure + contrast → sRGB) — re-run on slider changes with
+//! 3. Tone (light panel → sRGB) — re-run on slider changes with
 //!    generation-based cancel / coalescing (uses the in-RAM linear buffer)
 
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use super::decode::{
     decode_embedded_preview, decode_raw_preview, PreviewImage, PreviewSource, PREVIEW_MAX_DIM,
 };
 use super::pipeline::{apply_tone, develop_linear_with_progress, LinearPreview};
+use super::settings::ToneParams;
 use crate::catalog::{preview_cache, thumbnail_cache};
 
 /// Crossfade duration from thumbnail → demosaic (seconds).
@@ -39,10 +40,8 @@ enum ResultKind {
     LinearReady {
         linear: Arc<LinearPreview>,
         display: PreviewImage,
-        /// Exposure EV used to build `display`.
-        exposure_used: f32,
-        /// Contrast used to build `display`.
-        contrast_used: f32,
+        /// Tone params used to build `display`.
+        tone_used: ToneParams,
     },
     /// Linear develop failed; optional gamma-encoded fallback image.
     LinearFailed {
@@ -82,10 +81,8 @@ pub struct DevelopPreview {
     demosaic_progress: Option<f32>,
     /// Linear demosaic buffer for the current photo (pre-tone).
     linear: Option<Arc<LinearPreview>>,
-    /// Current exposure in EV stops.
-    exposure: f32,
-    /// Current contrast (`-100..=100`).
-    contrast: f32,
+    /// Current light-panel tone params.
+    tone: ToneParams,
     /// True while a tone slider is being dragged.
     dragging: bool,
     /// Longest edge (physical pixels) of the on-screen preview; 0 = unknown.
@@ -117,8 +114,7 @@ impl Default for DevelopPreview {
             settled: false,
             demosaic_progress: None,
             linear: None,
-            exposure: 0.0,
-            contrast: 0.0,
+            tone: ToneParams::default(),
             dragging: false,
             view_max_dim: 0,
             tone_gen: 0,
@@ -141,15 +137,14 @@ impl DevelopPreview {
     /// 1. Placeholder: library thumb (reflects develop edits) → develop
     ///    sRGB cache → embedded JPEG
     /// 2. Linear demosaic → RAM buffer (disk linear cache preferred)
-    /// 3. Apply tone (exposure + contrast) → display texture
+    /// 3. Apply tone → display texture
     pub fn open(
         &mut self,
         photo_id: i64,
         path: PathBuf,
         orientation: Option<i64>,
         catalog_dir: PathBuf,
-        exposure: f32,
-        contrast: f32,
+        tone: ToneParams,
     ) {
         if self.is_active_for(photo_id) {
             return;
@@ -164,8 +159,7 @@ impl DevelopPreview {
         self.fade_start = None;
         self.display_aspect = None;
         self.linear = None;
-        self.exposure = exposure;
-        self.contrast = contrast;
+        self.tone = tone;
         self.dragging = false;
         // Keep view_max_dim across photo switches (panel size is stable).
         self.tone_gen = 0;
@@ -249,7 +243,7 @@ impl DevelopPreview {
                         let dim = first_tone_dim
                             .min(linear.width.max(linear.height))
                             .max(1);
-                        let display = apply_tone(&linear, exposure, contrast, dim);
+                        let display = apply_tone(&linear, &tone, dim);
                         if let Some(report) = demosaic_report.as_mut() {
                             report(1.0);
                         }
@@ -260,8 +254,7 @@ impl DevelopPreview {
                             kind: ResultKind::LinearReady {
                                 linear: Arc::clone(&linear),
                                 display,
-                                exposure_used: exposure,
-                                contrast_used: contrast,
+                                tone_used: tone,
                             },
                         });
 
@@ -279,8 +272,7 @@ impl DevelopPreview {
                             }
                         }
                         // Refresh tone-current JPEG placeholder for next open.
-                        let cache_img =
-                            apply_tone(&linear, exposure, contrast, PREVIEW_MAX_DIM);
+                        let cache_img = apply_tone(&linear, &tone, PREVIEW_MAX_DIM);
                         if let Err(e) =
                             preview_cache::save_preview(&catalog_dir, photo_id, &cache_img)
                         {
@@ -307,20 +299,11 @@ impl DevelopPreview {
             .expect("spawn develop-preview");
     }
 
-    /// Update exposure (EV). Re-tones at the current on-screen preview size.
+    /// Update light-panel tone. Re-tones at the current on-screen preview size.
     /// In-flight tone jobs are superseded via `tone_gen` (render cancelling).
-    pub fn set_exposure(&mut self, exposure: f32, dragging: bool) {
-        self.set_tone(exposure, self.contrast, dragging);
-    }
-
-    /// Update exposure + contrast. Re-tones at the current on-screen preview size.
-    /// In-flight tone jobs are superseded via `tone_gen` (render cancelling).
-    pub fn set_tone(&mut self, exposure: f32, contrast: f32, dragging: bool) {
-        let changed = (self.exposure - exposure).abs() > 1e-6
-            || (self.contrast - contrast).abs() > 1e-6
-            || self.dragging != dragging;
-        self.exposure = exposure;
-        self.contrast = contrast;
+    pub fn set_tone(&mut self, tone: ToneParams, dragging: bool) {
+        let changed = !self.tone.approx_eq(&tone) || self.dragging != dragging;
+        self.tone = tone;
         self.dragging = dragging;
         if !changed && !self.tone_dirty {
             return;
@@ -414,15 +397,14 @@ impl DevelopPreview {
         self.tone_inflight = true;
         let tone_gen = self.tone_gen;
         let generation = self.generation;
-        let exposure = self.exposure;
-        let contrast = self.contrast;
+        let tone = self.tone;
         let max_dim = self.tone_max_dim();
         let tx = self.tx.clone();
 
         thread::Builder::new()
             .name("develop-tone".into())
             .spawn(move || {
-                let img = apply_tone(&linear, exposure, contrast, max_dim);
+                let img = apply_tone(&linear, &tone, max_dim);
                 let _ = tx.send(PreviewResult {
                     photo_id,
                     generation,
@@ -501,8 +483,7 @@ impl DevelopPreview {
                 ResultKind::LinearReady {
                     linear,
                     display,
-                    exposure_used,
-                    contrast_used,
+                    tone_used,
                 } => {
                     self.linear = Some(linear);
                     self.demosaic_progress = None;
@@ -528,9 +509,7 @@ impl DevelopPreview {
                     self.loading = false;
                     self.settled = true;
                     self.status = None;
-                    let need_retone = (self.exposure - exposure_used).abs() > 1e-6
-                        || (self.contrast - contrast_used).abs() > 1e-6;
-                    if need_retone {
+                    if !self.tone.approx_eq(&tone_used) {
                         self.tone_dirty = true;
                         if !self.fading() {
                             self.schedule_tone();
