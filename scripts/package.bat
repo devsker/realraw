@@ -62,40 +62,37 @@ exit /b 0
 set "TOOL_NAME=%~1"
 set "TOOL_PATH="
 
-REM 1. PATH
+REM 1. On PATH? Use just the name (lazy binding, PATH is already confirmed).
 where "%TOOL_NAME%" >nul 2>&1
-if not errorlevel 1 (
-  for /f "delims=" %%P in ('where "%TOOL_NAME%"') do (
-    set "TOOL_PATH=%%P"
-    goto :eof
-  )
-)
+if not errorlevel 1 set "TOOL_PATH=%TOOL_NAME%" & goto :eof
 
 REM 2. Scoop shims and app dirs
 if exist "%USERPROFILE%\scoop\shims\%TOOL_NAME%.exe" set "TOOL_PATH=%USERPROFILE%\scoop\shims\%TOOL_NAME%.exe" & goto :eof
-if /i "%TOOL_NAME%"=="makensis" (
-  if exist "%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" set "TOOL_PATH=%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" & goto :eof
-) else (
-  if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\%TOOL_NAME%.exe" set "TOOL_PATH=%USERPROFILE%\scoop\apps\wixtoolset\current\bin\%TOOL_NAME%.exe" & goto :eof
+if exist "%USERPROFILE%\scoop\apps\nsis\current\%TOOL_NAME%.exe" set "TOOL_PATH=%USERPROFILE%\scoop\apps\nsis\current\%TOOL_NAME%.exe" & goto :eof
+if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\%TOOL_NAME%.exe" set "TOOL_PATH=%USERPROFILE%\scoop\apps\wixtoolset\current\%TOOL_NAME%.exe" & goto :eof
+
+REM 3. Project-local portable tools
+if exist "tools\nsis-3.10\%TOOL_NAME%.exe" set "TOOL_PATH=tools\nsis-3.10\%TOOL_NAME%.exe" & goto :eof
+if exist "tools\nsis\%TOOL_NAME%.exe" set "TOOL_PATH=tools\nsis\%TOOL_NAME%.exe" & goto :eof
+if exist "tools\wix\%TOOL_NAME%.exe" set "TOOL_PATH=tools\wix\%TOOL_NAME%.exe" & goto :eof
+
+REM 4. CI portable tools
+if defined GITHUB_WORKSPACE (
+  if exist "%GITHUB_WORKSPACE%\tools\nsis-3.10\%TOOL_NAME%.exe" set "TOOL_PATH=%GITHUB_WORKSPACE%\tools\nsis-3.10\%TOOL_NAME%.exe" & goto :eof
+  if exist "%GITHUB_WORKSPACE%\tools\nsis\%TOOL_NAME%.exe" set "TOOL_PATH=%GITHUB_WORKSPACE%\tools\nsis\%TOOL_NAME%.exe" & goto :eof
+  if exist "%GITHUB_WORKSPACE%\tools\wix\%TOOL_NAME%.exe" set "TOOL_PATH=%GITHUB_WORKSPACE%\tools\wix\%TOOL_NAME%.exe" & goto :eof
 )
 
-REM 3. CI portable tools (under repo tools/)
-if /i "%TOOL_NAME%"=="makensis" (
-  for /d %%D in ("%~dp0..\tools\nsis-*") do if exist "%%D\makensis.exe" set "TOOL_PATH=%%D\makensis.exe" & goto :eof
-  if exist "%~dp0..\tools\nsis\makensis.exe" set "TOOL_PATH=%~dp0..\tools\nsis\makensis.exe" & goto :eof
-)
-if defined GITHUB_WORKSPACE if exist "%GITHUB_WORKSPACE%\tools\wix\%TOOL_NAME%.exe" set "TOOL_PATH=%GITHUB_WORKSPACE%\tools\wix\%TOOL_NAME%.exe" & goto :eof
-if exist "%~dp0..\tools\wix\%TOOL_NAME%.exe" set "TOOL_PATH=%~dp0..\tools\wix\%TOOL_NAME%.exe" & goto :eof
+REM 5. Traditional NSIS install
+if exist "%ProgramFiles(x86)%\NSIS\%TOOL_NAME%.exe" set "TOOL_PATH=%ProgramFiles(x86)%\NSIS\%TOOL_NAME%.exe" & goto :eof
+if exist "%ProgramFiles%\NSIS\%TOOL_NAME%.exe" set "TOOL_PATH=%ProgramFiles%\NSIS\%TOOL_NAME%.exe" & goto :eof
 
-REM 4. NSIS traditional install
-if /i "%TOOL_NAME%"=="makensis" (
-  if exist "%ProgramFiles(x86)%\NSIS\makensis.exe" set "TOOL_PATH=%ProgramFiles(x86)%\NSIS\makensis.exe" & goto :eof
-  if exist "%ProgramFiles%\NSIS\makensis.exe" set "TOOL_PATH=%ProgramFiles%\NSIS\makensis.exe" & goto :eof
-)
+REM 6. dotnet global tool install (common for WiX v4+)
+if exist "%USERPROFILE%\.dotnet\tools\%TOOL_NAME%.exe" set "TOOL_PATH=%USERPROFILE%\.dotnet\tools\%TOOL_NAME%.exe" & goto :eof
 
-REM 5. WiX Toolset v3 MSI install
-for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do if exist "%%D\bin\%TOOL_NAME%.exe" set "TOOL_PATH=%%D\bin\%TOOL_NAME%.exe" & goto :eof
-for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do if exist "%%D\bin\%TOOL_NAME%.exe" set "TOOL_PATH=%%D\bin\%TOOL_NAME%.exe" & goto :eof
+REM 7. WiX v4+ portable install (e.g. unzipped release archive)
+if exist "%ProgramFiles%\WiX\%TOOL_NAME%.exe" set "TOOL_PATH=%ProgramFiles%\WiX\%TOOL_NAME%.exe" & goto :eof
+if exist "%ProgramFiles(x86)%\WiX\%TOOL_NAME%.exe" set "TOOL_PATH=%ProgramFiles(x86)%\WiX\%TOOL_NAME%.exe" & goto :eof
 
 goto :eof
 
@@ -119,35 +116,21 @@ echo ==^> Done: target\release\%BIN_NAME%-%VERSION%-setup.exe
 exit /b 0
 
 :cmd_wix
-call :find_tool candle
+call :find_tool wix
 if not defined TOOL_PATH (
-  echo error: 'candle' (WiX Toolset v3) is required but not installed.
+  echo error: 'wix' ^(WiX Toolset v4+^) is required but not installed.
   echo install with:
-  echo   scoop bucket add extras
-  echo   scoop install wixtoolset nsis
+  echo   scoop install wixtoolset
   exit /b 1
 )
-set "CANDLE=%TOOL_PATH%"
-
-call :find_tool light
-if not defined TOOL_PATH (
-  echo error: 'light' (WiX Toolset v3) is required but not installed.
-  echo install with:
-  echo   scoop bucket add extras
-  echo   scoop install wixtoolset nsis
-  exit /b 1
-)
-set "LIGHT=%TOOL_PATH%"
+set "WIX=%TOOL_PATH%"
 
 call :ensure_release_bin
 if errorlevel 1 exit /b 1
 
-set "WIXOBJ=target\release\%BIN_NAME%.wixobj"
 set "MSI=target\release\%BIN_NAME%-%VERSION%-x64.msi"
 echo ==^> Building WiX MSI (v%VERSION%)...
-"%CANDLE%" -nologo -arch x64 -dProductVersion=%VERSION% -out "%WIXOBJ%" packaging\windows\realraw.wxs
-if errorlevel 1 exit /b 1
-"%LIGHT%" -nologo -out "%MSI%" "%WIXOBJ%"
+"%WIX%" build -nologo -arch x64 -d ProductVersion=%VERSION% -out "%MSI%" packaging\windows\realraw.wxs
 if errorlevel 1 exit /b 1
 echo ==^> Done: %MSI%
 exit /b 0
@@ -164,16 +147,11 @@ if defined TOOL_PATH (
   echo ==^> Skipping NSIS (makensis not found)
 )
 
-call :find_tool candle
+call :find_tool wix
 if not defined TOOL_PATH (
-  echo ==^> Skipping WiX (candle not found)
+  echo ==^> Skipping WiX (wix not found)
   exit /b 0
 )
-call :find_tool light
-if defined TOOL_PATH (
-  call :cmd_wix
-  if errorlevel 1 exit /b 1
-) else (
-  echo ==^> Skipping WiX (light not found)
-)
+call :cmd_wix
+if errorlevel 1 exit /b 1
 exit /b 0
