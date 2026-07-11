@@ -206,8 +206,17 @@ cmd_nsis() {
 
     ensure_release_bin
 
+    local project_root="$PWD"
+    # Convert to Windows native path when running under Git Bash/MSYS2
+    if command -v cygpath &>/dev/null; then
+        project_root="$(cygpath -w "$PWD")"
+    fi
+
     echo "==> Building NSIS installer (v${VERSION})..."
-    "$makensis" -DVERSION="$VERSION" packaging/windows/realraw.nsi
+    "$makensis" \
+        -DVERSION="$VERSION" \
+        -DPROJECT_ROOT="$project_root" \
+        packaging/windows/realraw.nsi
     echo "==> Done: target/release/${BIN_NAME}-${VERSION}-setup.exe"
 }
 

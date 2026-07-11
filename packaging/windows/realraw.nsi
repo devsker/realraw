@@ -1,9 +1,13 @@
 ; realraw NSIS installer
-; Build: makensis /DVERSION=0.1.0 packaging/windows/realraw.nsi
+; Build: makensis /DVERSION=0.1.0 /DPROJECT_ROOT=C:\path\to\realraw packaging/windows/realraw.nsi
 ; Requires: release binary at target/release/realraw.exe
 
 !ifndef VERSION
   !define VERSION "0.1.0"
+!endif
+
+!ifndef PROJECT_ROOT
+  !define PROJECT_ROOT "."
 !endif
 
 !define APP_NAME "realraw"
@@ -12,7 +16,7 @@
 !define APP_EXE "realraw.exe"
 
 Name "${APP_NAME}"
-OutFile "target\release\realraw-${VERSION}-setup.exe"
+OutFile "${PROJECT_ROOT}\target\release\${APP_NAME}-${VERSION}-setup.exe"
 InstallDir "$PROGRAMFILES64\${APP_NAME}"
 InstallDirRegKey HKLM "Software\${APP_NAME}" "InstallDir"
 RequestExecutionLevel admin
@@ -22,8 +26,8 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "assets\icon.ico"
-!define MUI_UNICON "assets\icon.ico"
+!define MUI_ICON "${PROJECT_ROOT}\assets\icon.ico"
+!define MUI_UNICON "${PROJECT_ROOT}\assets\icon.ico"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
@@ -45,8 +49,8 @@ VIAddVersionKey /LANG=1033 "LegalCopyright" "AGPL-3.0-or-later"
 
 Section "Install" SecInstall
   SetOutPath "$INSTDIR"
-  File "target\release\${APP_EXE}"
-  File "assets\icon.ico"
+  File "${PROJECT_ROOT}\target\release\${APP_EXE}"
+  File "${PROJECT_ROOT}\assets\icon.ico"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 

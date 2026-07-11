@@ -58,108 +58,87 @@ if errorlevel 1 exit /b 1
 echo ==^> Done: target\release\%BIN_NAME%.exe
 exit /b 0
 
-:find_makensis
-set "MAKENSIS="
-where makensis >nul 2>&1
+:find_tool
+set "TOOL_NAME=%~1"
+set "TOOL_PATH="
+
+REM 1. PATH
+where "%TOOL_NAME%" >nul 2>&1
 if not errorlevel 1 (
-  for /f "delims=" %%P in ('where makensis') do (
-    set "MAKENSIS=%%P"
+  for /f "delims=" %%P in ('where "%TOOL_NAME%"') do (
+    set "TOOL_PATH=%%P"
     goto :eof
   )
 )
-if exist "%GITHUB_WORKSPACE%\tools\nsis-3.10\makensis.exe" set "MAKENSIS=%GITHUB_WORKSPACE%\tools\nsis-3.10\makensis.exe" & goto :eof
-if exist "%~dp0..\tools\nsis-3.10\makensis.exe" set "MAKENSIS=%~dp0..\tools\nsis-3.10\makensis.exe" & goto :eof
-if exist "%~dp0..\tools\nsis\makensis.exe" set "MAKENSIS=%~dp0..\tools\nsis\makensis.exe" & goto :eof
-if exist "%USERPROFILE%\scoop\shims\makensis.exe" set "MAKENSIS=%USERPROFILE%\scoop\shims\makensis.exe" & goto :eof
-if exist "%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" set "MAKENSIS=%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" & goto :eof
-if exist "%ProgramFiles(x86)%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles(x86)%\NSIS\makensis.exe" & goto :eof
-if exist "%ProgramFiles%\NSIS\makensis.exe" set "MAKENSIS=%ProgramFiles%\NSIS\makensis.exe" & goto :eof
-exit /b 1
 
-:find_candle
-set "CANDLE="
-where candle >nul 2>&1
-if not errorlevel 1 (
-  for /f "delims=" %%P in ('where candle') do (
-    set "CANDLE=%%P"
-    goto :find_light_stub
-  )
+REM 2. Scoop shims and app dirs
+if exist "%USERPROFILE%\scoop\shims\%TOOL_NAME%.exe" set "TOOL_PATH=%USERPROFILE%\scoop\shims\%TOOL_NAME%.exe" & goto :eof
+if /i "%TOOL_NAME%"=="makensis" (
+  if exist "%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" set "TOOL_PATH=%USERPROFILE%\scoop\apps\nsis\current\makensis.exe" & goto :eof
+) else (
+  if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\%TOOL_NAME%.exe" set "TOOL_PATH=%USERPROFILE%\scoop\apps\wixtoolset\current\bin\%TOOL_NAME%.exe" & goto :eof
 )
-if exist "%GITHUB_WORKSPACE%\tools\wix\candle.exe" set "CANDLE=%GITHUB_WORKSPACE%\tools\wix\candle.exe" & goto :find_light_stub
-if exist "%~dp0..\tools\wix\candle.exe" set "CANDLE=%~dp0..\tools\wix\candle.exe" & goto :find_light_stub
-if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\candle.exe" set "CANDLE=%USERPROFILE%\scoop\apps\wixtoolset\current\bin\candle.exe" & goto :find_light_stub
-for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do (
-  if exist "%%D\bin\candle.exe" set "CANDLE=%%D\bin\candle.exe" & goto :find_light_stub
-)
-for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do (
-  if exist "%%D\bin\candle.exe" set "CANDLE=%%D\bin\candle.exe" & goto :find_light_stub
-)
-exit /b 1
 
-:find_light_stub
-if defined CANDLE (
-  for %%P in ("!CANDLE!") do if exist "%%~dpPlight.exe" set "LIGHT=%%~dpPlight.exe"
+REM 3. CI portable tools (under repo tools/)
+if /i "%TOOL_NAME%"=="makensis" (
+  for /d %%D in ("%~dp0..\tools\nsis-*") do if exist "%%D\makensis.exe" set "TOOL_PATH=%%D\makensis.exe" & goto :eof
+  if exist "%~dp0..\tools\nsis\makensis.exe" set "TOOL_PATH=%~dp0..\tools\nsis\makensis.exe" & goto :eof
 )
+if defined GITHUB_WORKSPACE if exist "%GITHUB_WORKSPACE%\tools\wix\%TOOL_NAME%.exe" set "TOOL_PATH=%GITHUB_WORKSPACE%\tools\wix\%TOOL_NAME%.exe" & goto :eof
+if exist "%~dp0..\tools\wix\%TOOL_NAME%.exe" set "TOOL_PATH=%~dp0..\tools\wix\%TOOL_NAME%.exe" & goto :eof
+
+REM 4. NSIS traditional install
+if /i "%TOOL_NAME%"=="makensis" (
+  if exist "%ProgramFiles(x86)%\NSIS\makensis.exe" set "TOOL_PATH=%ProgramFiles(x86)%\NSIS\makensis.exe" & goto :eof
+  if exist "%ProgramFiles%\NSIS\makensis.exe" set "TOOL_PATH=%ProgramFiles%\NSIS\makensis.exe" & goto :eof
+)
+
+REM 5. WiX Toolset v3 MSI install
+for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do if exist "%%D\bin\%TOOL_NAME%.exe" set "TOOL_PATH=%%D\bin\%TOOL_NAME%.exe" & goto :eof
+for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do if exist "%%D\bin\%TOOL_NAME%.exe" set "TOOL_PATH=%%D\bin\%TOOL_NAME%.exe" & goto :eof
+
 goto :eof
 
-:find_light
-set "LIGHT="
-where light >nul 2>&1
-if not errorlevel 1 (
-  for /f "delims=" %%P in ('where light') do (
-    set "LIGHT=%%P"
-    goto :eof
-  )
-)
-if exist "%GITHUB_WORKSPACE%\tools\wix\light.exe" set "LIGHT=%GITHUB_WORKSPACE%\tools\wix\light.exe" & goto :eof
-if exist "%~dp0..\tools\wix\light.exe" set "LIGHT=%~dp0..\tools\wix\light.exe" & goto :eof
-if exist "%USERPROFILE%\scoop\apps\wixtoolset\current\bin\light.exe" set "LIGHT=%USERPROFILE%\scoop\apps\wixtoolset\current\bin\light.exe" & goto :eof
-for /d %%D in ("%ProgramFiles(x86)%\WiX Toolset v*") do (
-  if exist "%%D\bin\light.exe" set "LIGHT=%%D\bin\light.exe" & goto :eof
-)
-for /d %%D in ("%ProgramFiles%\WiX Toolset v*") do (
-  if exist "%%D\bin\light.exe" set "LIGHT=%%D\bin\light.exe" & goto :eof
-)
-if defined CANDLE (
-  for %%P in ("!CANDLE!") do if exist "%%~dpPlight.exe" set "LIGHT=%%~dpPlight.exe"
-)
-exit /b 1
-
 :cmd_nsis
-call :find_makensis
-if not defined MAKENSIS (
+call :find_tool makensis
+if not defined TOOL_PATH (
   echo error: 'makensis' is required but not installed.
   echo install with:
   echo   scoop bucket add extras
   echo   scoop install wixtoolset nsis
   exit /b 1
 )
+set "MAKENSIS=%TOOL_PATH%"
 call :ensure_release_bin
 if errorlevel 1 exit /b 1
 
 echo ==^> Building NSIS installer (v%VERSION%)...
-"%MAKENSIS%" /DVERSION=%VERSION% packaging\windows\realraw.nsi
+"%MAKENSIS%" /DVERSION=%VERSION% "/DPROJECT_ROOT=%CD%" packaging\windows\realraw.nsi
 if errorlevel 1 exit /b 1
 echo ==^> Done: target\release\%BIN_NAME%-%VERSION%-setup.exe
 exit /b 0
 
 :cmd_wix
-call :find_candle
-call :find_light
-if not defined CANDLE (
+call :find_tool candle
+if not defined TOOL_PATH (
   echo error: 'candle' (WiX Toolset v3) is required but not installed.
   echo install with:
   echo   scoop bucket add extras
   echo   scoop install wixtoolset nsis
   exit /b 1
 )
-if not defined LIGHT (
+set "CANDLE=%TOOL_PATH%"
+
+call :find_tool light
+if not defined TOOL_PATH (
   echo error: 'light' (WiX Toolset v3) is required but not installed.
   echo install with:
   echo   scoop bucket add extras
   echo   scoop install wixtoolset nsis
   exit /b 1
 )
+set "LIGHT=%TOOL_PATH%"
+
 call :ensure_release_bin
 if errorlevel 1 exit /b 1
 
@@ -177,20 +156,24 @@ exit /b 0
 call :cmd_exe
 if errorlevel 1 exit /b 1
 
-call :find_makensis
-if defined MAKENSIS (
+call :find_tool makensis
+if defined TOOL_PATH (
   call :cmd_nsis
   if errorlevel 1 exit /b 1
 ) else (
   echo ==^> Skipping NSIS (makensis not found)
 )
 
-call :find_candle
-call :find_light
-if defined CANDLE if defined LIGHT (
+call :find_tool candle
+if not defined TOOL_PATH (
+  echo ==^> Skipping WiX (candle not found)
+  exit /b 0
+)
+call :find_tool light
+if defined TOOL_PATH (
   call :cmd_wix
   if errorlevel 1 exit /b 1
 ) else (
-  echo ==^> Skipping WiX (candle/light not found)
+  echo ==^> Skipping WiX (light not found)
 )
 exit /b 0
