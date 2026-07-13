@@ -302,14 +302,22 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(12.0);
                 section_header(ui, "Color");
                 {
-                    let h = slider_row(ui, "Temp", &mut app.develop.temp, -100.0..=100.0);
-                    any |= h.changed;
-                    dragging |= h.dragging;
+                    let hit = slider_row(ui, "Temp", &mut app.develop.temp, -100.0..=100.0);
+                    if hit.changed {
+                        any = true;
+                        app.develop_preview
+                            .set_tone(app.develop.tone(), hit.dragging);
+                    }
+                    dragging |= hit.dragging;
                 }
                 {
-                    let h = slider_row(ui, "Tint", &mut app.develop.tint, -100.0..=100.0);
-                    any |= h.changed;
-                    dragging |= h.dragging;
+                    let hit = slider_row(ui, "Tint", &mut app.develop.tint, -100.0..=100.0);
+                    if hit.changed {
+                        any = true;
+                        app.develop_preview
+                            .set_tone(app.develop.tone(), hit.dragging);
+                    }
+                    dragging |= hit.dragging;
                 }
 
                 if any {

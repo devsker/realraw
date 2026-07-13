@@ -15,6 +15,33 @@ use rawler::imgop::srgb::srgb_apply_gamma;
 use super::decode::{DecodeError, PreviewImage, PreviewSource, PREVIEW_MAX_DIM};
 use super::settings::ToneParams;
 
+/// White balance gain multiplier for the **Temp** slider (blue ↔ yellow).
+///
+/// At `t = 0` → ×1.0 (identity). At `t = ±100` → roughly ±0.8 stops
+/// (2^{±0.3}) along the R/B axis.
+const WB_TEMP_STOPS: f32 = 0.3;
+/// White balance gain multiplier for the **Tint** slider (green ↔ magenta).
+///
+/// At `t = 0` → ×1.0 (identity). At `t = ±100` → roughly ±0.4 stops
+/// (2^{±0.2}) on the G channel.
+const WB_TINT_STOPS: f32 = 0.2;
+
+/// Per-channel white-balance gains derived from Temp / Tint sliders.
+///
+/// Returns `[r, g, b]` multipliers to apply in **linear** space. The identity
+/// case (temp = tint = 0) returns `[1.0; 3]` — no change relative to the
+/// camera white balance already baked in by LibRaw.
+#[inline]
+fn wb_gains(temp: f32, tint: f32) -> [f32; 3] {
+    let t = (temp / 100.0).clamp(-1.0, 1.0);
+    let g = (tint / 100.0).clamp(-1.0, 1.0);
+    [
+        2.0_f32.powf(t * WB_TEMP_STOPS),
+        2.0_f32.powf(g * WB_TINT_STOPS),
+        2.0_f32.powf(-t * WB_TEMP_STOPS),
+    ]
+}
+
 /// LibRaw `params.highlight`: 0=clip, 1=unclip, 2=blend, 3..=9=rebuild.
 const LIBRAW_HIGHLIGHT_REBUILD: i32 = 3;
 /// LibRaw linear + `no_auto_bright` lands ~1 EV dark vs camera / prior rawler path.
@@ -374,13 +401,14 @@ fn apply_tone_rgb(r: f32, g: f32, b: f32, tone: &ToneParams) -> [f32; 3] {
 
 fn tone_to_preview(rgb: &[f32], width: u32, height: u32, tone: &ToneParams) -> PreviewImage {
     let gain = 2f32.powf(tone.exposure);
+    let [r_wb, g_wb, b_wb] = wb_gains(tone.temp, tone.tint);
     let n = width as usize * height as usize;
     let mut rgba = Vec::with_capacity(n * 4);
     for i in 0..n {
         let base = i * 3;
-        let rl = rgb[base] * gain;
-        let gl = rgb[base + 1] * gain;
-        let bl = rgb[base + 2] * gain;
+        let rl = rgb[base] * gain * r_wb;
+        let gl = rgb[base + 1] * gain * g_wb;
+        let bl = rgb[base + 2] * gain * b_wb;
         let [rl, gl, bl] = apply_tone_rgb(rl, gl, bl, tone);
         let r = srgb_apply_gamma(rl.clamp(0.0, 1.0));
         let g = srgb_apply_gamma(gl.clamp(0.0, 1.0));
@@ -774,5 +802,81 @@ mod tests {
         let b1 = apply_tone(&bright, &tone_with(|t| t.whites = -80.0), 2);
         assert!(d1.rgba[0] > d0.rgba[0], "blacks+ should lift darks");
         assert!(b1.rgba[0] < b0.rgba[0], "whites- should drop brights");
+    }
+
+    // ── White Balance ──────────────────────────────────────────────────────
+
+    #[test]
+    fn wb_identity_is_neutral() {
+        let [r, g, b] = wb_gains(0.0, 0.0);
+        assert!((r - 1.0).abs() < 1e-6, "r={r}");
+        assert!((g - 1.0).abs() < 1e-6, "g={g}");
+        assert!((b - 1.0).abs() < 1e-6, "b={b}");
+    }
+
+    #[test]
+    fn wb_positive_temp_warms() {
+        // +100 temp → R boosted, B reduced
+        let [r, g, b] = wb_gains(100.0, 0.0);
+        assert!(r > 1.0, "r should be >1 for warm temp: {r}");
+        assert!(b < 1.0, "b should be <1 for warm temp: {b}");
+        assert!((g - 1.0).abs() < 1e-6, "g should be neutral: {g}");
+    }
+
+    #[test]
+    fn wb_negative_temp_cools() {
+        // -100 temp → R reduced, B boosted
+        let [r, g, b] = wb_gains(-100.0, 0.0);
+        assert!(r < 1.0, "r should be <1 for cool temp: {r}");
+        assert!(b > 1.0, "b should be >1 for cool temp: {b}");
+        assert!((g - 1.0).abs() < 1e-6, "g should be neutral: {g}");
+    }
+
+    #[test]
+    fn wb_positive_tint_greens() {
+        // +100 tint → G boosted
+        let [r, g, b] = wb_gains(0.0, 100.0);
+        assert!(g > 1.0, "g should be >1 for positive tint: {g}");
+        assert!((r - 1.0).abs() < 1e-6, "r should be neutral: {r}");
+        assert!((b - 1.0).abs() < 1e-6, "b should be neutral: {b}");
+    }
+
+    #[test]
+    fn wb_negative_tint_magentas() {
+        // -100 tint → G reduced
+        let [r, g, b] = wb_gains(0.0, -100.0);
+        assert!(g < 1.0, "g should be <1 for negative tint: {g}");
+        assert!((r - 1.0).abs() < 1e-6, "r should be neutral: {r}");
+        assert!((b - 1.0).abs() < 1e-6, "b should be neutral: {b}");
+    }
+
+    #[test]
+    fn wb_clamps_out_of_range() {
+        let [r, g, b] = wb_gains(200.0, -200.0);
+        // Should clamp to [-1, 1] → same as ±100
+        let [r_lim, g_lim, b_lim] = wb_gains(100.0, -100.0);
+        assert!((r - r_lim).abs() < 1e-6);
+        assert!((g - g_lim).abs() < 1e-6);
+        assert!((b - b_lim).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wb_mid_values_scale_smoothly() {
+        let [r50, g50, b50] = wb_gains(50.0, 50.0);
+        let [r100, _, b100] = wb_gains(100.0, 0.0);
+        let [_, g100, _] = wb_gains(0.0, 100.0);
+        // At 50% slider, the multiplier should be between identity and full
+        assert!(r50 > 1.0 && r50 < r100, "r50={r50} should be between 1 and {r100}");
+        assert!(g50 > 1.0 && g50 < g100, "g50={g50} should be between 1 and {g100}");
+        assert!(b50 < 1.0 && b50 > b100, "b50={b50} should be between 1 and {b100}");
+    }
+
+    #[test]
+    fn wb_does_not_affect_exposure_only() {
+        // Default tone params have temp=0, tint=0 → should match old behavior
+        let lin = solid(4, 4, 0.5);
+        let a = apply_exposure(&lin, 0.0, 4);
+        let b = apply_tone(&lin, &ToneParams::default(), 4);
+        assert_eq!(a.rgba, b.rgba);
     }
 }

@@ -52,13 +52,16 @@ impl DevelopSettings {
             shadows: self.shadows,
             whites: self.whites,
             blacks: self.blacks,
+            temp: self.temp,
+            tint: self.tint,
         }
     }
 }
 
 /// Light-panel tone parameters applied in the develop pixel pipeline.
 ///
-/// Ranges: `exposure` in EV stops; others `-100..=100` (0 = identity).
+/// Ranges: `exposure` in EV stops; `temp`, `tint`, and other sliders `-100..=100`
+/// (0 = identity).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ToneParams {
     pub exposure: f32,
@@ -67,6 +70,8 @@ pub struct ToneParams {
     pub shadows: f32,
     pub whites: f32,
     pub blacks: f32,
+    pub temp: f32,
+    pub tint: f32,
 }
 
 impl Default for ToneParams {
@@ -78,6 +83,8 @@ impl Default for ToneParams {
             shadows: 0.0,
             whites: 0.0,
             blacks: 0.0,
+            temp: 0.0,
+            tint: 0.0,
         }
     }
 }
@@ -104,5 +111,7 @@ impl ToneParams {
             && (self.shadows - other.shadows).abs() < 1e-6
             && (self.whites - other.whites).abs() < 1e-6
             && (self.blacks - other.blacks).abs() < 1e-6
+            && (self.temp - other.temp).abs() < 1e-6
+            && (self.tint - other.tint).abs() < 1e-6
     }
 }
